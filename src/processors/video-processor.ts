@@ -29,11 +29,7 @@ export async function processVideo(videoId: string, context?: VideoContext) {
     
     // 1. Get video details from database
     const video = await prisma.video.findUnique({
-      where: { id: videoId },
-      include: {
-        project: true,
-        script: true
-      }
+      where: { id: videoId }
     })
     
     if (!video) {
@@ -98,9 +94,9 @@ export async function processVideo(videoId: string, context?: VideoContext) {
     })
     
     // 6. Generate video using platform template with context
-    const combinedSettings = {
-      ...video.settings,
-      ...context?.settings,
+    const combinedSettings: any = {
+      ...(video.settings || {}),
+      ...(context?.settings || {}),
       targetDuration: context?.targetDuration || video.targetDuration,
       layoutMode: context?.settings?.layoutMode || 'letterbox'  // Default to letterbox
     }
@@ -130,12 +126,12 @@ export async function processVideo(videoId: string, context?: VideoContext) {
     const metadata = await getVideoMetadata(outputPath)
     
     // 8. Upload to R2/S3
-    const s3Key = `videos/${video.project.organizationId}/${video.id}.mp4`
+    const s3Key = `videos/${video.projectId}/${video.id}.mp4`
     const videoUrl = await uploadToR2(outputPath, s3Key, 'video/mp4')
-    
+
     // 9. Generate thumbnail
     const thumbnailPath = await generateThumbnail(outputPath)
-    const thumbnailS3Key = `videos/${video.project.organizationId}/${video.id}_thumb.jpg`
+    const thumbnailS3Key = `videos/${video.projectId}/${video.id}_thumb.jpg`
     const thumbnailUrl = await uploadToR2(thumbnailPath, thumbnailS3Key, 'image/jpeg')
     
     // 10. Update database with results

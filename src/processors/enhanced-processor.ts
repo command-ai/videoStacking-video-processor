@@ -1,8 +1,7 @@
 import { prisma } from '../database/prisma-client.js'
 import { logger } from '../utils/logger.js'
-import VideoGenerator from '../core/VideoGeneratorWrapper.js'
 import { EnhancedVideoProcessor } from '../core/enhanced-processor.js'
-import { uploadToS3 } from '../../../VideoStacking/packages/api/src/utils/s3.js'
+import { uploadToR2 } from '../storage/r2-client.js'
 import { config } from '../config/environment.js'
 import path from 'path'
 import fs from 'fs/promises'
@@ -36,17 +35,10 @@ export async function processEnhancedVideo(data: EnhancementData) {
     voiceoverDetails: enhancements?.voiceover
   })
   
-  // Get job ID if passed for progress tracking
-  const jobId = (data as any).jobId
-  
   try {
     // Fetch video and media records from database
     const video = await prisma.video.findUnique({
-      where: { id: videoId },
-      include: {
-        project: true,
-        script: true
-      }
+      where: { id: videoId }
     })
     
     if (!video) {
@@ -114,7 +106,7 @@ export async function processEnhancedVideo(data: EnhancementData) {
         media: mediaWithVideo, // Pass media array with original video included
         enhancements,
         settings,
-        onProgress: (progress) => {
+        onProgress: (progress: any) => {
           logger.info(`Enhancement progress: ${progress.percent}% - ${progress.stage}`)
         }
       })
@@ -138,9 +130,9 @@ export async function processEnhancedVideo(data: EnhancementData) {
       const s3Key = `enhanced-videos/${organizationId}/${videoId}-${platform}.mp4`
       const videoBuffer = await fs.readFile(enhancedVideoPath)
       logger.info('STEP E: Video loaded into buffer', { bufferSize: videoBuffer.length })
-      
-      await uploadToS3(s3Key, videoBuffer, 'video/mp4')
-      logger.info('STEP F: Upload to S3 completed', { s3Key })
+
+      await uploadToR2(s3Key, videoBuffer, 'video/mp4')
+      logger.info('STEP F: Upload to R2 completed', { s3Key })
       
       const videoUrl = `https://your-r2-domain.com/${s3Key}` // Will be replaced with signed URL
       

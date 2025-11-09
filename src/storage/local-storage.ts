@@ -14,7 +14,7 @@ export async function ensureStorageDir() {
 export async function uploadToLocal(
   localPath: string,
   storageKey: string,
-  contentType?: string
+  _contentType?: string
 ): Promise<string> {
   try {
     await ensureStorageDir()

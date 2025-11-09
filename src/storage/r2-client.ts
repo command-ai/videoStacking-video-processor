@@ -4,7 +4,7 @@ import { config } from '../config/environment.js'
 import { logger } from '../utils/logger.js'
 import fs from 'fs'
 import { pipeline } from 'stream/promises'
-import { uploadToLocal, downloadFromLocal, getLocalUrl } from './local-storage.js'
+import { uploadToLocal, downloadFromLocal } from './local-storage.js'
 
 // Check if we're using local storage (development mode without real R2/S3)
 const useLocalStorage = config.NODE_ENV === 'development' && 
