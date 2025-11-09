@@ -44,6 +44,13 @@ COPY --from=build /app/dist ./dist
 COPY --from=build /app/package*.json ./
 COPY --from=build /app/prisma ./prisma/
 
+# Copy the generated Prisma client
+COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
+COPY --from=build /app/node_modules/@prisma ./node_modules/@prisma
+
+# Generate Prisma client in production (as fallback)
+RUN npx prisma generate
+
 # Copy core FFMPEG implementation
 COPY --from=build /app/src/core ./dist/core
 
