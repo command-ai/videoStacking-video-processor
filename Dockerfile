@@ -71,10 +71,9 @@ ENV TEMP_DIR=/tmp/video-processor
 ENV ASSET_PATH=/app/assets
 
 # Railway provides PORT automatically at runtime
-EXPOSE $PORT
+# No EXPOSE needed - Railway handles port assignment
 
-# Health check for Railway
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-  CMD node -e "require('http').get('http://localhost:3002/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
+# Health check disabled - Railway has built-in healthchecks
+# Use Railway dashboard to configure healthcheck endpoint at /health
 
 CMD ["sh", "-c", "test -f dist/index.js && node dist/index.js || npx tsx src/index.ts"]
