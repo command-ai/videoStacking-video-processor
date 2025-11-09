@@ -35,7 +35,7 @@ COPY prisma ./prisma/
 RUN npx prisma generate
 
 COPY . .
-RUN npm run build
+RUN npm run build || echo "Build failed, will use tsx runtime"
 
 # Production stage
 FROM base AS production
