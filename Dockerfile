@@ -64,16 +64,19 @@ RUN chown -R nodejs:nodejs /tmp/video-processor /app/assets
 USER nodejs
 
 # Environment variables
-ENV NODE_ENV=production
-ENV FFMPEG_PATH=ffmpeg
-ENV FFPROBE_PATH=ffprobe
-ENV TEMP_DIR=/tmp/video-processor
-ENV ASSET_PATH=/app/assets
+ENV NODE_ENV=production \
+    PORT=3002 \
+    HOST=0.0.0.0 \
+    FFMPEG_PATH=ffmpeg \
+    FFPROBE_PATH=ffprobe \
+    TEMP_DIR=/tmp/video-processor \
+    ASSET_PATH=/app/assets
 
-# Railway provides PORT automatically at runtime
-# No EXPOSE needed - Railway handles port assignment
+# Expose port
+EXPOSE 3002
 
-# Health check disabled - Railway has built-in healthchecks
-# Use Railway dashboard to configure healthcheck endpoint at /health
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+  CMD node -e "require('http').get('http://localhost:3002/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
 
 CMD ["sh", "-c", "test -f dist/index.js && node dist/index.js || npx tsx src/index.ts"]
