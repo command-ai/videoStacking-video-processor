@@ -1,0 +1,1969 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==========================================
+// CORE MODELS
+// ==========================================
+
+model User {
+  id        String   @id @default(cuid())
+  clerkId   String   @unique
+  email     String   @unique
+  firstName String?
+  lastName  String?
+  imageUrl  String?
+  timezone  String   @default("UTC")
+  settings  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Multi-tenant relationships
+  organizationMemberships OrganizationMember[]
+  personalAccount         Account?
+
+  // Claude Orchestrator specific
+  personalSwarms Swarm[] @relation("PersonalSwarms")
+
+  // Social Media
+  socialConnections SocialMediaConnection[]
+  socialPosts       SocialMediaPost[]
+
+  // Checklist Execution Approvals
+  executionApprovals ExecutionApproval[] @relation("ExecutionApprovals")
+
+  @@map("users")
+}
+
+// ==========================================
+// MULTI-TENANT MODELS
+// ==========================================
+
+model Organization {
+  id          String  @id @default(cuid())
+  clerkId     String  @unique
+  name        String
+  slug        String  @unique
+  imageUrl    String?
+  description String?
+
+  // Multi-tenant architecture
+  tier        Tier    @default(SHARED)
+  schemaName  String? // For dedicated schema tier
+  databaseUrl String? // For dedicated instance tier
+
+  settings  Json?
+  metadata  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relationships
+  members              OrganizationMember[]
+  account              Account?
+  swarms               Swarm[]
+  plugins              PluginInstallation[]
+  seoTrackingCampaigns SeoTrackingCampaign[]
+  proxyConfigurations  ProxyConfiguration[]
+  globalLogos          GlobalLogo[]
+  socialConnections    SocialConnection[]
+  socialPosts          SocialPost[]
+  postQueues           PostQueue[]
+  oauthStates          OAuthState[]
+  ChecklistTemplate    ChecklistTemplate[]
+  Project              Project[]
+  ChecklistExecution   ChecklistExecution[]
+  CaptureLink          CaptureLink[]
+
+  @@map("organizations")
+}
+
+model OrganizationMember {
+  id             String   @id @default(cuid())
+  userId         String
+  organizationId String
+  role           String   @default("member") // admin, member, viewer
+  permissions    String[] @default([])
+  joinedAt       DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId])
+  @@index([organizationId, role])
+  @@map("organization_members")
+}
+
+// ==========================================
+// BILLING & ACCOUNTS
+// ==========================================
+
+model Account {
+  id     String      @id @default(cuid())
+  type   AccountType @default(PERSONAL)
+  tier   String      @default("free")
+  status String      @default("active")
+
+  // Relations (one of these will be set)
+  userId         String? @unique
+  organizationId String? @unique
+
+  // Billing
+  stripeCustomerId   String?  @unique
+  billingCycle       String   @default("monthly")
+  currentPeriodStart DateTime @default(now())
+  currentPeriodEnd   DateTime @default(now())
+
+  // Usage tracking
+  usageData Json @default("{}")
+  limits    Json @default("{}")
+
+  // Trial
+  trialEndsAt    DateTime?
+  trialStartedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  user         User?         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  subscription Subscription?
+  usageRecords UsageRecord[]
+
+  @@map("accounts")
+}
+
+model Subscription {
+  id        String @id @default(cuid())
+  accountId String @unique
+
+  // Stripe data
+  stripeSubscriptionId String @unique
+  stripePriceId        String
+  stripeProductId      String
+
+  status   String @default("active")
+  quantity Int    @default(1)
+
+  currentPeriodStart DateTime  @default(now())
+  currentPeriodEnd   DateTime  @default(now())
+  canceledAt         DateTime?
+  cancelAtPeriodEnd  Boolean   @default(false)
+
+  metadata  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+  @@map("subscriptions")
+}
+
+model UsageRecord {
+  id        String @id @default(cuid())
+  accountId String
+
+  // What was used
+  featureType String // swarm_execution, api_calls, storage, etc
+  quantity    Int    @default(1)
+  metadata    Json? // Additional context
+
+  // When
+  usageDate     DateTime @default(now())
+  billingPeriod String // YYYY-MM format
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId, billingPeriod])
+  @@index([featureType, usageDate])
+  @@map("usage_records")
+}
+
+// ==========================================
+// CLAUDE ORCHESTRATOR SPECIFIC
+// ==========================================
+
+model Swarm {
+  id        String @id @default(cuid())
+  name      String
+  objective String @db.Text
+  strategy  String @default("development")
+
+  // Configuration
+  config    Json @default("{}")
+  maxAgents Int  @default(2)
+  timeout   Int  @default(300000) // 5 minutes
+
+  // Status
+  status   SwarmStatus @default(QUEUED)
+  progress Int         @default(0)
+  result   Json?
+  error    String?
+
+  // Execution details
+  startedAt   DateTime?
+  completedAt DateTime?
+  duration    Int? // milliseconds
+
+  // Multi-tenant association
+  organizationId String?
+  userId         String? // For personal swarms
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  organization Organization?    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User?            @relation("PersonalSwarms", fields: [userId], references: [id], onDelete: Cascade)
+  executions   SwarmExecution[]
+
+  @@index([status, createdAt])
+  @@index([organizationId, status])
+  @@index([userId, status])
+  @@map("swarms")
+}
+
+model SwarmExecution {
+  id      String @id @default(cuid())
+  swarmId String
+
+  // Execution details
+  attemptNumber Int         @default(1)
+  status        SwarmStatus
+  output        Json?
+  error         String?
+
+  // Metrics
+  tokensUsed Int?
+  apiCalls   Int?
+
+  startedAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  swarm Swarm @relation(fields: [swarmId], references: [id], onDelete: Cascade)
+
+  @@index([swarmId, attemptNumber])
+  @@map("swarm_executions")
+}
+
+model Plugin {
+  id          String  @id @default(cuid())
+  name        String  @unique
+  displayName String
+  description String?
+  version     String
+  author      String?
+
+  // Plugin details
+  category String
+  tags     String[]
+  icon     String?
+
+  // Technical details
+  packageName  String   @unique
+  entryPoint   String
+  permissions  String[] @default([])
+  dependencies Json?
+
+  // Availability
+  isPublic   Boolean @default(false)
+  isOfficial Boolean @default(false)
+  price      Int     @default(0) // in cents
+
+  metadata  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  installations PluginInstallation[]
+
+  @@index([category, isPublic])
+  @@map("plugins")
+}
+
+model PluginInstallation {
+  id             String @id @default(cuid())
+  pluginId       String
+  organizationId String
+
+  // Installation details
+  version     String
+  isEnabled   Boolean  @default(true)
+  config      Json?
+  permissions String[] @default([])
+
+  installedAt DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  plugin       Plugin       @relation(fields: [pluginId], references: [id])
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([pluginId, organizationId])
+  @@map("plugin_installations")
+}
+
+// ==========================================
+// ENUMS
+// ==========================================
+
+enum Tier {
+  SHARED // Row-level security
+  DEDICATED_SCHEMA // Schema isolation
+  DEDICATED_INSTANCE // Separate database
+}
+
+enum AccountType {
+  PERSONAL
+  ORGANIZATION
+  AGENCY
+  ENTERPRISE
+}
+
+enum SwarmStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model SeoTrackingCampaign {
+  id             String  @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+
+  // Campaign Configuration
+  searchEngines String[] @default(["google"]) // google, bing, yahoo, etc.
+  resultTypes   String[] @default(["organic"]) // organic, paid, map
+
+  // Location Settings
+  locationData     Json // Stores parsed location data from XLSX
+  locationStrategy String @default("city") // city, zip, coordinates
+
+  // Schedule
+  frequency String    @default("daily") // daily, weekly, monthly
+  lastRunAt DateTime?
+  nextRunAt DateTime?
+  isActive  Boolean   @default(true)
+
+  // Execution Settings
+  maxWorkers    Int     @default(2)
+  useProxies    Boolean @default(true)
+  retryFailures Boolean @default(true)
+  maxRetries    Int     @default(3)
+
+  // Storage Settings
+  storeRawHtml  Boolean @default(true)
+  htmlRetention Int     @default(90) // days
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  organization    Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  trackingTargets SeoTrackingTarget[]
+  executions      SeoExecution[]
+
+  @@index([organizationId, isActive])
+  @@index([nextRunAt])
+  @@map("seo_tracking_campaigns")
+}
+
+model SeoTrackingTarget {
+  id         String @id @default(cuid())
+  campaignId String
+
+  // Target Configuration
+  keyword String
+  domain  String
+  url     String? // Optional specific URL to track
+
+  // Tracking Settings
+  trackCompetitors Boolean @default(true)
+  competitorLimit  Int     @default(10)
+
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  campaign           SeoTrackingCampaign    @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  results            SeoResult[]
+  contentSuggestions SeoContentSuggestion[]
+
+  @@unique([campaignId, keyword, domain])
+  @@index([campaignId, isActive])
+  @@map("seo_tracking_targets")
+}
+
+model SeoExecution {
+  id         String @id @default(cuid())
+  campaignId String
+
+  // Execution Details
+  status   String @default("pending") // pending, running, completed, failed, partial
+  progress Int    @default(0) // 0-100
+
+  // Timing
+  startedAt   DateTime?
+  completedAt DateTime?
+  duration    Int? // milliseconds
+
+  // Results Summary
+  totalSearches      Int @default(0)
+  successfulSearches Int @default(0)
+  failedSearches     Int @default(0)
+
+  // Error Tracking
+  errors Json? // Array of error details
+
+  // Resource Usage
+  proxiesUsed String[] @default([])
+  workersUsed Int      @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  campaign           SeoTrackingCampaign    @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  results            SeoResult[]
+  contentSuggestions SeoContentSuggestion[]
+  jobs               SeoJob[]
+
+  @@index([campaignId, status])
+  @@index([startedAt])
+  @@map("seo_executions")
+}
+
+model SeoJob {
+  id          String @id @default(cuid())
+  executionId String
+
+  // Job Details
+  jobType  String // search, parse, store
+  status   String @default("queued") // queued, processing, completed, failed
+  priority Int    @default(0)
+
+  // Job Data
+  input  Json // Search parameters
+  output Json? // Results
+  error  String?
+
+  // Execution Details
+  attempts    Int     @default(0)
+  maxAttempts Int     @default(3)
+  workerId    String?
+
+  // Timing
+  queuedAt    DateTime  @default(now())
+  startedAt   DateTime?
+  completedAt DateTime?
+
+  // Relations
+  execution SeoExecution @relation(fields: [executionId], references: [id], onDelete: Cascade)
+
+  @@index([executionId, status])
+  @@index([status, priority])
+  @@map("seo_jobs")
+}
+
+model SeoResult {
+  id          String @id @default(cuid())
+  targetId    String
+  executionId String
+
+  // Search Context
+  searchEngine    String
+  searchQuery     String
+  location        String
+  locationDetails Json // Full location data (city, state, coordinates, etc.)
+  searchDate      DateTime
+
+  // Result Data
+  resultType String // organic, paid, map, featured, people_also_ask
+  position   Int // 1-100+
+  page       Int // SERP page number
+
+  // Position Context - NEW
+  blockPosition   Int? // Position of the block (e.g., ads block, map pack) on page
+  positionInBlock Int? // Position within the block (e.g., 2nd result in map pack)
+  isSponsored     Boolean @default(false) // True for paid/sponsored results
+
+  // Page Details
+  title       String
+  url         String
+  domain      String
+  description String? @db.Text
+
+  // Additional Metadata
+  isOwnDomain Boolean @default(false)
+  metadata    Json? // Extra data like ratings, price, reviews, hours, etc.
+
+  // Raw Data Storage
+  htmlStorageUrl String? // S3 URL for raw HTML
+  screenshot     String? // S3 URL for screenshot
+
+  createdAt DateTime @default(now())
+
+  // Relations
+  target      SeoTrackingTarget @relation(fields: [targetId], references: [id], onDelete: Cascade)
+  execution   SeoExecution      @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  competitors SeoCompetitor[]
+
+  @@index([targetId, searchDate])
+  @@index([executionId])
+  @@index([domain, position])
+  @@map("seo_results")
+}
+
+model SeoCompetitor {
+  id       String @id @default(cuid())
+  resultId String
+
+  // Competitor Details
+  position    Int
+  domain      String
+  url         String
+  title       String
+  description String? @db.Text
+
+  // Analysis
+  isDirectCompetitor Boolean @default(false)
+  competitorType     String? // local, national, directory, etc.
+
+  // Relations
+  result SeoResult @relation(fields: [resultId], references: [id], onDelete: Cascade)
+
+  @@index([resultId])
+  @@index([domain])
+  @@map("seo_competitors")
+}
+
+model SeoContentSuggestion {
+  id          String @id @default(cuid())
+  executionId String
+  targetId    String
+
+  // Content Source
+  source         String // people_also_ask, related_searches, featured_snippet
+  sourcePosition Int // Position in the source block
+
+  // Content Details
+  question     String? @db.Text // For People Also Ask
+  answer       String? @db.Text // For People Also Ask
+  relatedQuery String? // For related searches
+  snippet      String? @db.Text // For featured snippets
+
+  // Metadata
+  searchQuery  String // Original search query that generated this
+  location     String
+  searchEngine String
+  searchDate   DateTime
+
+  createdAt DateTime @default(now())
+
+  // Relations
+  execution SeoExecution      @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  target    SeoTrackingTarget @relation(fields: [targetId], references: [id], onDelete: Cascade)
+
+  @@index([executionId])
+  @@index([targetId])
+  @@index([source, searchDate])
+  @@map("seo_content_suggestions")
+}
+
+model ProxyConfiguration {
+  id             String @id @default(cuid())
+  organizationId String
+
+  // Proxy Details
+  name         String
+  type         String // http, socks5, residential
+  host         String
+  port         Int
+  username     String?
+  passwordHash String? // Encrypted password
+
+  // Configuration
+  rotationType     String @default("sticky") // sticky, rotating
+  rotationInterval Int? // minutes
+
+  // Status
+  isActive       Boolean   @default(true)
+  lastUsedAt     DateTime?
+  lastTestAt     DateTime?
+  lastTestResult String? // success, failed, timeout
+
+  // Usage Limits
+  maxConcurrent Int  @default(1)
+  dailyLimit    Int?
+  monthlyLimit  Int?
+  currentUsage  Json @default("{}")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, isActive])
+  @@map("proxy_configurations")
+}
+
+// ==========================================
+// SEO TASK MANAGEMENT MODELS
+// ==========================================
+
+model SeoProject {
+  id             String        @id @default(cuid())
+  organizationId String
+  clientName     String
+  projectName    String
+  status         ProjectStatus @default(ACTIVE)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  tasks SeoTask[]
+
+  @@index([organizationId])
+  @@map("seo_projects")
+}
+
+model SeoTask {
+  id        String     @id @default(cuid())
+  projectId String
+  project   SeoProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  // Core fields (First Principles validated)
+  title   String
+  status  TaskStatus @default(PENDING)
+  dueDate DateTime
+
+  // Minimal metadata
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  completedAt DateTime?
+
+  // Progress tracking
+  progress SeoTaskProgress[]
+
+  @@index([projectId])
+  @@index([status])
+  @@index([dueDate])
+  @@map("seo_tasks")
+}
+
+model SeoTaskProgress {
+  id     String  @id @default(cuid())
+  taskId String
+  task   SeoTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  // Simple progress entry
+  note        String?
+  completedAt DateTime @default(now())
+
+  @@index([taskId])
+  @@map("seo_task_progress")
+}
+
+enum ProjectStatus {
+  DRAFT
+  ACTIVE
+  IN_PROGRESS
+  COMPLETED
+  ARCHIVED
+}
+
+enum TaskStatus {
+  PENDING
+  COMPLETED
+}
+
+// ==========================================
+// VIDEO PLATFORM MODELS
+// ==========================================
+// VideoProject model REMOVED - merged into unified Project model
+// All video functionality now in Project model (lines 1274-1376)
+// Migration completed - see packages/api/scripts/migrate-video-projects.ts
+// ==========================================
+
+model VideoScript {
+  id          String   @id @default(cuid())
+  projectId   String
+  name        String
+  content     Json // Structured script data
+  aiGenerated Boolean  @default(false)
+  aiModel     String? // gpt-4, claude-3, etc.
+  version     Int      @default(1)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  videos  Video[]
+
+  @@index([projectId])
+  @@map("video_scripts")
+}
+
+model VideoMedia {
+  id             String   @id @default(cuid())
+  projectId      String
+  name           String // Display name for the media
+  type           String // image, video, audio, logo, background, overlay
+  tags           String[] @default([]) // Tags for categorization
+  filename       String
+  originalName   String
+  mimeType       String
+  size           BigInt
+  s3Key          String   @unique
+  thumbnailS3Key String?
+  duration       Float? // For video files in seconds
+  dimensions     Json? // {width, height}
+  metadata       Json? // Additional metadata
+  uploadedBy     String // User ID who uploaded
+  createdAt      DateTime @default(now())
+
+  // Relations
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([uploadedBy])
+  @@index([type])
+  @@map("video_media")
+}
+
+model Video {
+  id             String    @id @default(cuid())
+  projectId      String
+  scriptId       String?
+  mediaIds       String[]  @default([]) // Array of VideoMedia IDs used in this video
+  jobId          String?   @unique // External job processing ID
+  status         String    @default("queued") // queued, processing, completed, failed
+  platform       String // youtube, tiktok, instagram, facebook, etc.
+  s3Key          String? // Generated video S3 key
+  thumbnailS3Key String?
+  duration       Float? // Video duration in seconds
+  fileSize       BigInt? // File size in bytes
+  settings       Json? // Platform-specific settings
+  metadata       Json? // Resolution, codec, fps, etc.
+  error          String? // Error message if failed
+  processingTime Int? // Processing time in seconds
+  createdBy      String // User ID who created
+  createdAt      DateTime  @default(now())
+  startedAt      DateTime?
+  completedAt    DateTime?
+
+  // Dynamic duration fields
+  targetDuration      Float? // Planned duration
+  actualDuration      Float? // Actual duration based on voiceover
+  voiceoverDuration   Float? // Voiceover audio duration
+  voiceoverStartDelay Float? @default(0.5) // Delay before voiceover starts
+  voiceoverEndDelay   Float? @default(1.0) // Delay after voiceover ends
+
+  // Relations
+  project          Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  script           VideoScript?      @relation(fields: [scriptId], references: [id])
+  socialPosts      SocialPost[]
+  postQueues       PostQueue[]
+  socialMediaPosts SocialMediaPost[]
+
+  @@index([projectId, status])
+  @@index([jobId])
+  @@index([createdBy])
+  @@map("videos")
+}
+
+model MusicLibrary {
+  id       String  @id @default(cuid())
+  name     String
+  category String // upbeat, corporate, inspirational, ambient, electronic, acoustic
+  mood     String // Happy, Confident, Powerful, Relaxed, Futuristic, Friendly
+  duration Float // Duration in seconds
+  bpm      Int? // Beats per minute (optional)
+  key      String? // Musical key (optional)
+
+  // File information
+  filename     String
+  mimeType     String @default("audio/mp3")
+  fileSize     BigInt
+  s3Key        String @unique
+  waveformData Json? // Waveform visualization data
+
+  // Metadata
+  artist    String?
+  album     String?
+  copyright String?
+  license   String   @default("royalty-free")
+  tags      String[] @default([])
+
+  // Usage restrictions
+  isActive   Boolean @default(true)
+  isPremium  Boolean @default(false)
+  usageCount Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([category, isActive])
+  @@index([mood])
+  @@index([tags])
+  @@map("music_library")
+}
+
+model GlobalLogo {
+  id             String  @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+
+  // File information
+  filename       String
+  mimeType       String  @default("image/png")
+  fileSize       BigInt
+  s3Key          String
+  thumbnailS3Key String?
+
+  // Logo settings
+  isDefault Boolean @default(false)
+  isActive  Boolean @default(true)
+
+  // Metadata
+  width       Int?
+  height      Int?
+  aspectRatio Float?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, isActive])
+  @@index([isDefault])
+  @@map("global_logos")
+}
+
+model MusicTrack {
+  id       String   @id @default(cuid())
+  name     String
+  s3Key    String   @unique
+  s3Url    String
+  duration Int // Duration in seconds
+  category String
+  tags     String[]
+  metadata Json? // Additional metadata
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([category])
+  @@index([tags])
+  @@map("music_tracks")
+}
+
+// ==========================================
+// SOCIAL MEDIA OAUTH MODELS
+// ==========================================
+
+model SocialConnection {
+  id             String  @id @default(cuid())
+  organizationId String
+  platform       String // youtube, facebook, instagram, twitter, tiktok, linkedin
+  accountName    String? // Display name of the connected account
+  accountId      String? // Platform-specific account ID
+
+  // OAuth credentials (encrypted)
+  accessToken  String    @db.Text
+  refreshToken String?   @db.Text
+  tokenType    String?
+  expiresAt    DateTime?
+  scope        String?   @db.Text
+
+  // Connection metadata
+  isActive    Boolean   @default(true)
+  isPrimary   Boolean   @default(false) // Primary account for the platform
+  lastSyncAt  DateTime?
+  lastErrorAt DateTime?
+  lastError   String?   @db.Text
+
+  // Platform-specific data
+  platformData Json? // Additional platform-specific data
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  posts        SocialPost[]
+  queuedPosts  PostQueue[]
+
+  @@unique([organizationId, platform, accountId])
+  @@index([organizationId, platform, isActive])
+  @@index([expiresAt])
+  @@map("social_connections")
+}
+
+model SocialPost {
+  id             String  @id @default(cuid())
+  organizationId String
+  connectionId   String
+  videoId        String?
+
+  // Post details
+  platform       String // youtube, facebook, instagram, twitter, tiktok, linkedin
+  postType       String // video, short, reel, story, post
+  platformPostId String? // ID on the social platform
+
+  // Content
+  title       String?
+  description String?  @db.Text
+  hashtags    String[] @default([])
+  mentions    String[] @default([])
+
+  // Status
+  status       String    @default("draft") // draft, scheduled, posting, posted, failed
+  scheduledFor DateTime?
+  publishedAt  DateTime?
+
+  // Error tracking
+  failureReason String?   @db.Text
+  retryCount    Int       @default(0)
+  lastRetryAt   DateTime?
+
+  // Metrics (updated via webhooks/API)
+  views             BigInt    @default(0)
+  likes             BigInt    @default(0)
+  comments          BigInt    @default(0)
+  shares            BigInt    @default(0)
+  impressions       BigInt    @default(0)
+  engagementRate    Float?
+  lastMetricsUpdate DateTime?
+
+  // Platform-specific data
+  platformData Json? // Additional platform-specific data/settings
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  organization Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  connection   SocialConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  video        Video?           @relation(fields: [videoId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, status])
+  @@index([connectionId, platform])
+  @@index([videoId])
+  @@index([scheduledFor])
+  @@index([publishedAt])
+  @@map("social_posts")
+}
+
+model PostQueue {
+  id             String @id @default(cuid())
+  organizationId String
+  connectionId   String
+  videoId        String
+
+  // Queue details
+  priority Int    @default(0) // Higher number = higher priority
+  status   String @default("pending") // pending, processing, completed, failed, cancelled
+
+  // Scheduling
+  scheduledFor DateTime
+  timezone     String   @default("UTC")
+
+  // Post configuration
+  postConfig Json // Platform-specific post settings
+
+  // Processing
+  processingStartedAt   DateTime?
+  processingCompletedAt DateTime?
+  attempts              Int       @default(0)
+  maxAttempts           Int       @default(3)
+
+  // Error tracking
+  lastError   String?   @db.Text
+  lastErrorAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  organization Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  connection   SocialConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  video        Video            @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, status])
+  @@index([connectionId, scheduledFor])
+  @@index([status, priority, scheduledFor])
+  @@map("post_queue")
+}
+
+model OAuthState {
+  id             String @id @default(cuid())
+  state          String @unique // Random state parameter for OAuth
+  organizationId String
+  platform       String
+
+  // Security
+  codeChallenge String? // For PKCE flow
+  redirectUri   String
+
+  // Expiration
+  expiresAt DateTime
+  used      Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+
+  // Relations
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([state])
+  @@index([expiresAt])
+  @@map("oauth_states")
+}
+
+// ==========================================
+// SOCIAL MEDIA ENHANCED MODELS
+// ==========================================
+
+model SocialMediaConnection {
+  id              String @id @default(cuid())
+  userId          String
+  organizationId  String
+  platform        String // youtube, facebook, instagram, twitter, tiktok, linkedin
+  status          String @default("active") // active, expired, revoked
+  encryptedTokens String @db.Text
+  accountInfo     Json? // Platform account details
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, platform])
+  @@index([organizationId])
+  @@map("social_media_connections")
+}
+
+model SocialMediaPost {
+  id             String    @id @default(cuid())
+  projectId      String?   @map("project_id")
+  videoId        String    @map("video_id")
+  platforms      String[]
+  status         String    @default("pending") // pending, scheduled, publishing, published, partial, failed, cancelled
+  scheduledFor   DateTime? @map("scheduled_for")
+  publishedAt    DateTime? @map("published_at")
+  metadata       Json?
+  results        Json?
+  error          String?
+  jobId          String?   @map("job_id")
+  userId         String    @map("user_id")
+  organizationId String    @map("organization_id")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  project       Project?                  @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  video         Video                     @relation(fields: [videoId], references: [id], onDelete: Restrict)
+  user          User                      @relation(fields: [userId], references: [id], onDelete: Restrict)
+  platformPosts SocialMediaPlatformPost[]
+
+  @@index([projectId])
+  @@index([videoId])
+  @@index([organizationId])
+  @@index([status])
+  @@map("social_media_posts")
+}
+
+model SocialMediaPlatformPost {
+  id          String    @id @default(cuid())
+  postId      String
+  platform    String
+  externalId  String?
+  status      String
+  url         String?
+  metadata    Json?
+  error       String?
+  publishedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  post SocialMediaPost @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  @@unique([postId, platform])
+  @@index([platform])
+  @@map("social_media_platform_posts")
+}
+
+model SocialMediaAnalytics {
+  id             String   @id @default(cuid())
+  platform       String
+  event          String
+  videoId        String?
+  projectId      String?
+  organizationId String
+  metadata       Json?
+  timestamp      DateTime @default(now())
+
+  @@index([platform])
+  @@index([organizationId])
+  @@index([timestamp])
+  @@map("social_media_analytics")
+}
+
+// ==========================================
+// CHECKLIST & PROJECT MANAGEMENT SYSTEM
+// ==========================================
+
+// ==========================================
+// CHECKLIST TEMPLATES
+// ==========================================
+
+model ChecklistTemplate {
+  id          String  @id @default(cuid())
+  title       String
+  description String? @db.Text
+  version     Int     @default(1)
+
+  // Ownership & Multi-tenancy
+  ownerId        String // User or Organization ID
+  ownerType      String // "user" or "organization"
+  organizationId String? // If organization-owned
+  createdBy      String // User who created
+
+  // Industry & Categorization
+  industry String // e.g., "hvac", "plumbing", "electrical"
+  category String // e.g., "installation", "maintenance", "inspection"
+  tags     String[] @default([])
+
+  // Visibility & Access
+  visibility    TemplateVisibility @default(PRIVATE)
+  isMarketplace Boolean            @default(false) // Available in marketplace
+  price         Int                @default(0) // Price in cents (0 = free)
+  purchaseCount Int                @default(0)
+
+  // Template Structure (JSON)
+  structure Json // { sections: [{ id, title, order, tasks: [...] }] }
+
+  // Version Control
+  parentTemplateId String? // If forked/cloned
+  isArchived       Boolean   @default(false)
+  publishedAt      DateTime?
+
+  // Usage Statistics
+  usageCount    Int    @default(0)
+  averageRating Float? // Average rating from users
+
+  // Metadata
+  metadata Json? // Additional flexible data
+  settings Json? // Template-specific settings
+
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  archivedAt DateTime?
+
+  // Relations
+  organization   Organization?              @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  parentTemplate ChecklistTemplate?         @relation("TemplateForks", fields: [parentTemplateId], references: [id])
+  forks          ChecklistTemplate[]        @relation("TemplateForks")
+  executions     ChecklistExecution[]
+  versions       ChecklistTemplateVersion[]
+  purchases      ChecklistPurchase[]
+  ratings        ChecklistRating[]
+  captureLinks   CaptureLink[]
+
+  @@index([organizationId, visibility])
+  @@index([industry, category])
+  @@index([visibility, isMarketplace])
+  @@index([createdBy])
+  @@index([tags])
+  @@map("checklist_templates")
+}
+
+model ChecklistTemplateVersion {
+  id         String   @id @default(cuid())
+  templateId String
+  version    Int
+  structure  Json // Snapshot of structure at this version
+  changelog  String?  @db.Text
+  createdBy  String
+  createdAt  DateTime @default(now())
+
+  template ChecklistTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@unique([templateId, version])
+  @@index([templateId])
+  @@map("checklist_template_versions")
+}
+
+model ChecklistPurchase {
+  id              String   @id @default(cuid())
+  templateId      String
+  userId          String
+  organizationId  String?
+  price           Int // Price at time of purchase
+  stripePaymentId String?
+  purchasedAt     DateTime @default(now())
+
+  template ChecklistTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@unique([templateId, userId])
+  @@index([userId])
+  @@index([organizationId])
+  @@map("checklist_purchases")
+}
+
+model ChecklistRating {
+  id         String   @id @default(cuid())
+  templateId String
+  userId     String
+  rating     Int // 1-5 stars
+  comment    String?  @db.Text
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  template ChecklistTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@unique([templateId, userId])
+  @@index([templateId, rating])
+  @@map("checklist_ratings")
+}
+
+// ==========================================
+// PROJECTS
+// ==========================================
+
+model Project {
+  id          String  @id @default(cuid())
+  name        String
+  description String? @db.Text
+
+  // Associated checklist template (optional)
+  templateId String? // Reference to ChecklistTemplate
+
+  // Multi-tenant
+  organizationId String
+  createdBy      String // User who created
+
+  // Location Information
+  address String?
+  city    String?
+  state   String?
+  zipCode String?
+  country String? @default("USA")
+
+  // GPS Coordinates
+  latitude     Float?
+  longitude    Float?
+  locationData Json? // Additional location metadata
+
+  // Customer Information
+  customerName  String?
+  customerEmail String?
+  customerPhone String?
+  customerData  Json? // Flexible customer info
+
+  // Project Details
+  projectType String? // e.g., "installation", "repair", "maintenance"
+  industry    String? // e.g., "hvac", "plumbing"
+  status      ProjectStatus   @default(ACTIVE)
+  priority    ProjectPriority @default(MEDIUM)
+
+  // Scheduling
+  startDate      DateTime?
+  endDate        DateTime?
+  estimatedHours Float?
+  actualHours    Float?
+
+  // Team Assignments
+  assignedTeam  String[] @default([]) // Array of user IDs
+  assignedUsers String[] @default([]) // User IDs for schedule matching
+
+  // Scheduling (for fallback matching)
+  scheduledDate DateTime? // Date project is scheduled for
+
+  // QR Code for Field Access
+  qrCode      String? @unique // Unique QR code identifier
+  qrCodeUrl   String? // S3 URL to QR code image
+  publicToken String? @unique // Token for public access
+
+  // Budget & Billing
+  estimatedCost Float?
+  actualCost    Float?
+  billingStatus String? @default("pending") // pending, invoiced, paid
+
+  // Metadata
+  metadata Json?
+  settings Json?
+  tags     String[] @default([])
+
+  // Video Generation (merged from VideoProject)
+  videoSettings Json? @default("{}") // Video-specific settings (format, resolution, etc.)
+
+  // Audit Trail
+  isArchived Boolean   @default(false)
+  archivedAt DateTime?
+  archivedBy String?
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  completedAt DateTime?
+
+  // Relations
+  organization      Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  executions        ChecklistExecution[]
+  media             ProjectMedia[]
+  notes             ProjectNote[]
+  timeline          ProjectTimeline[]
+  accessLogs        ProjectAccessLog[]
+  captureLinks      CaptureLink[]
+  captureAccessLogs CaptureAccessLog[]
+
+  // Video Generation Relations (merged from VideoProject)
+  videoScripts     VideoScript[]
+  videoMedia       VideoMedia[]
+  videos           Video[]
+  socialMediaPosts SocialMediaPost[]
+
+  @@index([organizationId, status])
+  @@index([qrCode])
+  @@index([publicToken])
+  @@index([customerEmail])
+  @@index([assignedTeam])
+  @@index([assignedUsers])
+  @@index([startDate, endDate])
+  @@index([scheduledDate, organizationId])
+  @@index([latitude, longitude])
+  @@map("projects")
+}
+
+model ProjectNote {
+  id        String   @id @default(cuid())
+  projectId String
+  content   String   @db.Text
+  createdBy String
+  noteType  String?  @default("general") // general, issue, update, customer
+  isPinned  Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([createdBy])
+  @@map("project_notes")
+}
+
+model ProjectTimeline {
+  id          String   @id @default(cuid())
+  projectId   String
+  eventType   String // created, status_change, team_assigned, execution_completed, etc.
+  description String   @db.Text
+  performedBy String
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, createdAt])
+  @@map("project_timeline")
+}
+
+// ==========================================
+// CHECKLIST EXECUTIONS
+// ==========================================
+
+model ChecklistExecution {
+  id String @id @default(cuid())
+
+  // Template Reference (Optional for freeform mode)
+  templateId      String?
+  templateVersion Int? // Version of template used
+
+  // Capture Mode
+  captureMode  String  @default("guided") // "guided" or "freeform"
+  currentStage Int     @default(0) // Workflow stage (0-3)
+  accessToken  String? // Reference to capture link token
+  capturedBy   String? // Name/phone from QR flow
+
+  // Project Association (Optional)
+  projectId String?
+
+  // Ownership & Multi-tenancy
+  organizationId String
+  executedBy     String // User who executed
+
+  // Location Context
+  locationName String? // e.g., "Customer Site", "Main Office"
+  address      String?
+  latitude     Float?
+  longitude    Float?
+  locationData Json? // Additional location metadata
+
+  // Execution Status
+  status   ExecutionStatus @default(DRAFT)
+  progress Float           @default(0.0) // 0.0 to 100.0
+
+  // Execution Data
+  executionData Json // { sections: [{ tasks: [{ completed, timestamp, media, notes }] }] }
+
+  // Public Access
+  publicToken     String?   @unique // Token for public sharing
+  qrCodeUrl       String? // S3 URL to QR code image
+  publicExpiresAt DateTime? // Expiration for public access
+  allowPublicView Boolean   @default(false)
+
+  // Timing
+  startedAt   DateTime?
+  completedAt DateTime?
+  reviewedAt  DateTime?
+  reviewedBy  String?
+  duration    Int? // Total execution time in seconds
+
+  // Quality & Review
+  qualityScore   Float? // 0.0 to 100.0
+  reviewNotes    String? @db.Text
+  requiresReview Boolean @default(false)
+
+  // Metadata
+  metadata Json?
+  settings Json?
+  tags     String[] @default([])
+
+  // Audit
+  isArchived Boolean   @default(false)
+  archivedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  template          ChecklistTemplate?   @relation(fields: [templateId], references: [id], onDelete: Restrict)
+  project           Project?             @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  organization      Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  media             ExecutionMedia[]
+  signatures        ExecutionSignature[]
+  accessLogs        ExecutionAccessLog[]
+  approvals         ExecutionApproval[]
+  captureAccessLogs CaptureAccessLog[]
+  voiceNotes        VoiceNote[]
+  voiceCommands     VoiceCommand[]
+
+  @@index([templateId])
+  @@index([projectId])
+  @@index([organizationId, status])
+  @@index([executedBy])
+  @@index([publicToken])
+  @@index([status, completedAt])
+  @@index([captureMode])
+  @@index([currentStage])
+  @@index([accessToken])
+  @@map("checklist_executions")
+}
+
+model ExecutionApproval {
+  id          String   @id @default(cuid())
+  executionId String
+  approverId  String
+  approved    Boolean
+  notes       String?  @db.Text
+  createdAt   DateTime @default(now())
+
+  execution ChecklistExecution @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  approver  User               @relation("ExecutionApprovals", fields: [approverId], references: [id], onDelete: Restrict)
+
+  @@unique([executionId, approverId])
+  @@index([executionId])
+  @@map("execution_approvals")
+}
+
+model ExecutionSignature {
+  id             String   @id @default(cuid())
+  executionId    String
+  signedBy       String // Name of person who signed
+  signerRole     String? // e.g., "technician", "customer", "supervisor"
+  signatureS3Key String // S3 key for signature image
+  signedAt       DateTime @default(now())
+  ipAddress      String?
+  userAgent      String?
+
+  execution ChecklistExecution @relation(fields: [executionId], references: [id], onDelete: Cascade)
+
+  @@index([executionId])
+  @@map("execution_signatures")
+}
+
+// ==========================================
+// MEDIA MANAGEMENT
+// ==========================================
+
+model ExecutionMedia {
+  id          String @id @default(cuid())
+  executionId String
+
+  // Media Details
+  mediaType    MediaType
+  filename     String
+  originalName String
+  mimeType     String
+  size         BigInt
+
+  // Storage
+  storageType   StorageType @default(CLOUD)
+  s3Key         String? // Primary storage key
+  s3Url         String? // Direct URL (if applicable)
+  localPath     String? // Local storage path (if applicable)
+  thirdPartyUrl String? // External storage URL
+
+  // Thumbnails & Previews
+  thumbnailS3Key String?
+  thumbnailUrl   String?
+
+  // Media Metadata
+  duration   Float? // For video/audio in seconds
+  dimensions Json? // { width, height } for images/videos
+  metadata   Json? // EXIF, codec, bitrate, etc.
+
+  // Context
+  taskId    String? // Which task this media belongs to
+  taskName  String? // Task name for reference
+  sectionId String? // Which section in the checklist
+
+  // Location & Timing
+  latitude   Float?
+  longitude  Float?
+  capturedAt DateTime @default(now())
+  capturedBy String // User who captured
+
+  // Tags & Organization
+  quickTags String[] @default([]) // Tags added during capture
+  aiTags    String[] @default([]) // AI-generated tags
+  notes     String?  @db.Text
+
+  // Ownership & Access
+  ownerType  OwnerType       @default(ORGANIZATION)
+  visibility MediaVisibility @default(PRIVATE)
+
+  // Processing Status
+  processedAt DateTime?
+  ocrText     String?   @db.Text // OCR extracted text
+  aiAnalysis  Json? // AI-generated analysis
+
+  // Audit
+  isDeleted Boolean   @default(false)
+  deletedAt DateTime?
+  deletedBy String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  execution  ChecklistExecution @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  voiceNotes VoiceNote[]        @relation("VoiceNoteMedia")
+
+  @@index([executionId])
+  @@index([mediaType])
+  @@index([capturedBy])
+  @@index([capturedAt])
+  @@index([quickTags])
+  @@index([isDeleted])
+  @@map("execution_media")
+}
+
+// ==========================================
+// VOICE & SPEECH MODELS
+// ==========================================
+
+model VoiceNote {
+  id          String  @id @default(cuid())
+  executionId String
+  taskId      String?
+  mediaId     String?
+
+  // Transcript
+  transcript String @db.Text
+  language   String @default("en-US")
+  confidence Float?
+
+  // Audio (optional)
+  audioUrl   String?
+  audioS3Key String?
+  duration   Int? // seconds
+  fileSize   Int? // bytes
+
+  // Analysis
+  tags      String[]
+  sentiment String? // positive, negative, neutral
+  keywords  Json?
+  summary   String?  @db.Text
+
+  // Context
+  captureMode  String @default("manual") // manual, voice_command, auto
+  deviceInfo   Json?
+  gpsLatitude  Float?
+  gpsLongitude Float?
+
+  // Metadata
+  capturedAt DateTime @default(now())
+  capturedBy String?
+  updatedAt  DateTime @updatedAt
+
+  // Relations
+  execution ChecklistExecution @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  media     ExecutionMedia?    @relation("VoiceNoteMedia", fields: [mediaId], references: [id], onDelete: SetNull)
+
+  @@index([executionId, taskId])
+  @@index([capturedAt])
+  @@index([capturedBy])
+  @@index([tags])
+  @@map("voice_notes")
+}
+
+model VoiceCommand {
+  id          String @id @default(cuid())
+  executionId String
+
+  command    String // The recognized command
+  transcript String // Raw transcript
+  confidence Float
+
+  executed     Boolean @default(false)
+  result       Json? // Execution result/status
+  errorMessage String?
+
+  // Context
+  deviceInfo Json?
+  sessionId  String?
+
+  timestamp DateTime @default(now())
+
+  execution ChecklistExecution @relation(fields: [executionId], references: [id], onDelete: Cascade)
+
+  @@index([executionId, timestamp])
+  @@index([executed])
+  @@index([sessionId])
+  @@map("voice_commands")
+}
+
+model ProjectMedia {
+  id        String @id @default(cuid())
+  projectId String
+
+  // Media Details
+  mediaType    MediaType
+  filename     String
+  originalName String
+  mimeType     String
+  size         BigInt
+
+  // Storage
+  storageType   StorageType @default(CLOUD)
+  s3Key         String?
+  s3Url         String?
+  localPath     String?
+  thirdPartyUrl String?
+
+  // Thumbnails & Previews
+  thumbnailS3Key String?
+  thumbnailUrl   String?
+
+  // Media Metadata
+  duration   Float?
+  dimensions Json?
+  metadata   Json?
+
+  // Context
+  category    String? // e.g., "before", "after", "progress", "issue"
+  description String? @db.Text
+
+  // Location & Timing
+  latitude   Float?
+  longitude  Float?
+  capturedAt DateTime @default(now())
+  capturedBy String
+
+  // Tags & Organization
+  tags   String[] @default([])
+  aiTags String[] @default([])
+
+  // Ownership
+  ownerType  OwnerType       @default(ORGANIZATION)
+  visibility MediaVisibility @default(PRIVATE)
+
+  // Processing
+  processedAt DateTime?
+  ocrText     String?   @db.Text
+  aiAnalysis  Json?
+
+  // Audit
+  isDeleted Boolean   @default(false)
+  deletedAt DateTime?
+  deletedBy String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([mediaType])
+  @@index([category])
+  @@index([capturedBy])
+  @@index([capturedAt])
+  @@map("project_media")
+}
+
+// ==========================================
+// SHARING & ACCESS CONTROL
+// ==========================================
+
+model PublicShare {
+  id         String @id @default(cuid())
+  shareToken String @unique // Unique token for accessing
+
+  // What is being shared
+  resourceType String // "execution", "project", "media"
+  resourceId   String // ID of the resource
+
+  // Ownership
+  organizationId String
+  createdBy      String
+
+  // Access Control
+  allowDownload   Boolean @default(false)
+  allowComments   Boolean @default(false)
+  requirePassword Boolean @default(false)
+  passwordHash    String?
+
+  // Expiration
+  expiresAt DateTime?
+  maxViews  Int? // Maximum number of views allowed
+  viewCount Int       @default(0)
+
+  // QR Code
+  qrCodeS3Key String?
+  qrCodeUrl   String?
+
+  // Metadata
+  metadata Json?
+
+  // Audit
+  isActive       Boolean   @default(true)
+  lastAccessedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  accessLogs ShareAccessLog[]
+
+  @@index([shareToken])
+  @@index([resourceType, resourceId])
+  @@index([organizationId])
+  @@index([expiresAt, isActive])
+  @@map("public_shares")
+}
+
+model ShareAccessLog {
+  id      String @id @default(cuid())
+  shareId String
+
+  // Access Details
+  ipAddress String
+  userAgent String?
+  country   String?
+  city      String?
+
+  // Action
+  action String @default("view") // view, download
+
+  accessedAt DateTime @default(now())
+
+  // Relations
+  share PublicShare @relation(fields: [shareId], references: [id], onDelete: Cascade)
+
+  @@index([shareId, accessedAt])
+  @@index([ipAddress])
+  @@map("share_access_logs")
+}
+
+model ProjectAccessLog {
+  id         String   @id @default(cuid())
+  projectId  String
+  userId     String? // Null if accessed via public link
+  action     String // viewed, edited, media_added, etc.
+  ipAddress  String?
+  userAgent  String?
+  accessedAt DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, accessedAt])
+  @@index([userId])
+  @@map("project_access_logs")
+}
+
+model ExecutionAccessLog {
+  id          String   @id @default(cuid())
+  executionId String
+  userId      String?
+  action      String
+  ipAddress   String?
+  userAgent   String?
+  accessedAt  DateTime @default(now())
+
+  execution ChecklistExecution @relation(fields: [executionId], references: [id], onDelete: Cascade)
+
+  @@index([executionId, accessedAt])
+  @@index([userId])
+  @@map("execution_access_logs")
+}
+
+// ==========================================
+// CAPTURE LINKS (QR Code / Public Link System)
+// ==========================================
+
+model CaptureLink {
+  id             String  @id @default(cuid())
+  token          String  @unique // Unique URL token
+  projectId      String?
+  organizationId String
+
+  // Capture Configuration
+  captureMode String // "guided" or "freeform"
+  templateId  String?
+
+  // Access Control
+  requireName   Boolean   @default(false)
+  requirePhone  Boolean   @default(false)
+  allowedEmails String[]  @default([])
+  expiresAt     DateTime?
+  maxUses       Int?
+  usageCount    Int       @default(0)
+
+  // AI Matching Configuration
+  autoMatchProject  Boolean @default(true)
+  matchRadiusMeters Int     @default(100)
+
+  // Audit Fields
+  createdBy String
+  createdAt DateTime  @default(now())
+  revokedAt DateTime?
+  isActive  Boolean   @default(true)
+
+  // Relations
+  project      Project?           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  organization Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  template     ChecklistTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  accessLogs   CaptureAccessLog[]
+
+  @@index([token])
+  @@index([projectId])
+  @@index([organizationId, isActive])
+  @@index([expiresAt])
+  @@index([captureMode])
+  @@map("capture_links")
+}
+
+model CaptureAccessLog {
+  id          String  @id @default(cuid())
+  linkId      String
+  projectId   String?
+  executionId String?
+
+  // Accessor Information
+  accessorName  String?
+  accessorPhone String?
+
+  // Session Data
+  ipAddress    String?
+  userAgent    String?
+  gpsLatitude  Float?
+  gpsLongitude Float?
+  accessedAt   DateTime @default(now())
+
+  // Usage Metrics
+  captureCount Int @default(0)
+
+  // Relations
+  link      CaptureLink         @relation(fields: [linkId], references: [id], onDelete: Cascade)
+  project   Project?            @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  execution ChecklistExecution? @relation(fields: [executionId], references: [id], onDelete: SetNull)
+
+  @@index([linkId, accessedAt])
+  @@index([projectId])
+  @@index([executionId])
+  @@index([gpsLatitude, gpsLongitude])
+  @@index([accessorPhone, executionId])
+  @@map("capture_access_logs")
+}
+
+// ==========================================
+// CHECKLIST ENUMS
+// ==========================================
+
+enum TemplateVisibility {
+  PRIVATE // Only owner can access
+  ORGANIZATION // All organization members
+  PUBLIC // Anyone can view
+  MARKETPLACE // Listed in marketplace
+}
+
+enum ProjectPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum ExecutionStatus {
+  DRAFT // Just created, not started
+  IN_PROGRESS // Being filled out
+  COMPLETED // All tasks done
+  UNDER_REVIEW // Awaiting review
+  APPROVED // Review approved
+  REJECTED // Review rejected, needs rework
+  ARCHIVED // Archived
+}
+
+enum MediaType {
+  PHOTO
+  VIDEO
+  AUDIO
+  DOCUMENT
+  SIGNATURE
+}
+
+enum StorageType {
+  CLOUD // S3 or similar
+  LOCAL // Local device storage
+  THIRD_PARTY // External URL (Dropbox, Google Drive, etc.)
+}
+
+enum OwnerType {
+  ORGANIZATION
+  USER
+  CUSTOMER
+}
+
+enum MediaVisibility {
+  PRIVATE // Only owner
+  TEAM // Team members
+  PROJECT // Anyone on project
+  CUSTOMER // Customer can view
+  PUBLIC // Public access
+}

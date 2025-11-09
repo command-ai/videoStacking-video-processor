@@ -1,0 +1,28 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "Dockerfile"
+  },
+  "deploy": {
+    "startCommand": "npm start",
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 3,
+    "healthcheckPath": "/health",
+    "healthcheckTimeout": 30,
+    "region": "us-west1",
+    "scaling": {
+      "minReplicas": 0,
+      "maxReplicas": 3,
+      "targetCPUPercent": 80
+    },
+    "sleepAfterInactivitySeconds": 300
+  },
+  "environments": {
+    "production": {
+      "build": {
+        "buildCommand": "npm run build"
+      }
+    }
+  }
+}
