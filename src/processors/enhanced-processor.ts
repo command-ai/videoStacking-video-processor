@@ -90,7 +90,7 @@ export async function processEnhancedVideo(data: EnhancementData) {
       } as any)
       
       // Prepare assets including the original video
-      const assets = await prepareAssets(mediaWithVideo, tempDir)
+      await prepareAssets(mediaWithVideo, tempDir)
       
       // Initialize enhanced processor
       const enhancedProcessor = new EnhancedVideoProcessor({
@@ -131,7 +131,7 @@ export async function processEnhancedVideo(data: EnhancementData) {
       const videoBuffer = await fs.readFile(enhancedVideoPath)
       logger.info('STEP E: Video loaded into buffer', { bufferSize: videoBuffer.length })
 
-      await uploadToR2(s3Key, videoBuffer, 'video/mp4')
+      await uploadToR2(s3Key, videoBuffer as any, 'video/mp4')
       logger.info('STEP F: Upload to R2 completed', { s3Key })
       
       const videoUrl = `https://your-r2-domain.com/${s3Key}` // Will be replaced with signed URL

@@ -42,7 +42,7 @@ const enhanceSchema = z.object({
     outro: z.any().optional(),
     frameAssets: z.any().optional()
   }),
-  settings: z.any(),
+  settings: z.any().default({}),
   organizationId: z.string()
 })
 

@@ -94,9 +94,11 @@ export async function processVideo(videoId: string, context?: VideoContext) {
     })
     
     // 6. Generate video using platform template with context
+    const videoSettings = (video.settings as any) || {}
+    const contextSettings = (context?.settings as any) || {}
     const combinedSettings: any = {
-      ...(video.settings || {}),
-      ...(context?.settings || {}),
+      ...videoSettings,
+      ...contextSettings,
       targetDuration: context?.targetDuration || video.targetDuration,
       layoutMode: context?.settings?.layoutMode || 'letterbox'  // Default to letterbox
     }
