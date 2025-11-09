@@ -1,7 +1,7 @@
 # VideoStacking Video Processor Dockerfile
 # Railway deployment with FFmpeg support
 
-FROM node:23-alpine AS base
+FROM node:20-alpine3.17 AS base
 
 # Install FFmpeg and dependencies
 RUN apk add --no-cache \
@@ -65,13 +65,13 @@ USER nodejs
 
 # Environment variables
 ENV NODE_ENV=production
-ENV PORT=3002
 ENV FFMPEG_PATH=ffmpeg
 ENV FFPROBE_PATH=ffprobe
 ENV TEMP_DIR=/tmp/video-processor
 ENV ASSET_PATH=/app/assets
 
-EXPOSE 3002
+# Railway provides PORT automatically at runtime
+EXPOSE $PORT
 
 # Health check for Railway
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
