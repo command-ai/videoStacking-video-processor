@@ -69,7 +69,7 @@ class FFmpegRenderer {
   }
 
   /**
-   * Build FFmpeg command - WORKING IMPLEMENTATION from patched version
+   * Build FFmpeg command - MEMORY-EFFICIENT TWO-PASS for many images
    */
   async buildCommand(options) {
     const {
@@ -90,8 +90,13 @@ class FFmpegRenderer {
       transition = { type: 'fade', duration: 0.5 } // Default fade transition
     } = options;
 
+    // For >8 images, use memory-efficient two-pass approach to avoid Railway resource limits
+    if (images.length > 8) {
+      return this.buildCommandTwoPass(options);
+    }
+
     const command = ffmpeg();
-    
+
     // Add all image inputs
     images.forEach(img => command.input(img));
     
@@ -152,6 +157,139 @@ class FFmpegRenderer {
         `-t`, duration.toString()
       ])
       .output(outputPath);
+
+    return command;
+  }
+
+  /**
+   * Build command using two-pass approach for many images (memory-efficient)
+   * Pass 1: Convert each image to video segment
+   * Pass 2: Concatenate segments (simpler than complex filter graph)
+   */
+  async buildCommandTwoPass(options) {
+    const {
+      images,
+      voiceOver,
+      backgroundMusic,
+      logo,
+      reviewImage,
+      outputPath,
+      videoWidth,
+      videoHeight,
+      duration,
+      logoSize,
+      reviewCardSize,
+      preset = 'medium',
+      quality = 23,
+      imageMode = this.defaultImageMode
+    } = options;
+
+    console.log(`🔄 Using two-pass approach for ${images.length} images (memory-efficient)`);
+
+    const segmentDuration = duration / images.length;
+    const tempDir = path.dirname(outputPath);
+    const segments = [];
+
+    // Pass 1: Create video segment for each image
+    for (let i = 0; i < images.length; i++) {
+      const img = images[i];
+      const segmentPath = path.join(tempDir, `segment_${i}.mp4`);
+      segments.push(segmentPath);
+
+      await new Promise((resolve, reject) => {
+        ffmpeg(img)
+          .inputOptions(['-loop', '1', '-t', segmentDuration.toString()])
+          .outputOptions([
+            '-vf', `scale=${videoWidth}:${videoHeight}:force_original_aspect_ratio=decrease,pad=${videoWidth}:${videoHeight}:(ow-iw)/2:(oh-ih)/2:black`,
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',  // Fast encoding for segments
+            '-pix_fmt', 'yuv420p',
+            '-r', '30'
+          ])
+          .output(segmentPath)
+          .on('end', resolve)
+          .on('error', reject)
+          .run();
+      });
+    }
+
+    // Pass 2: Concatenate segments with audio/overlays
+    const concatListPath = path.join(tempDir, 'concat_list.txt');
+    await fs.writeFile(concatListPath, segments.map(s => `file '${s}'`).join('\n'));
+
+    const command = ffmpeg()
+      .input(concatListPath)
+      .inputOptions(['-f', 'concat', '-safe', '0']);
+
+    // Add audio inputs
+    if (voiceOver) {
+      command.input(voiceOver);
+    }
+    if (backgroundMusic) {
+      command.input(backgroundMusic);
+    }
+
+    // Add overlay inputs
+    if (logo) {
+      command.input(logo);
+    }
+    if (reviewImage) {
+      command.input(reviewImage);
+    }
+
+    // Build simpler filter for overlays and audio
+    const filters = [];
+    let currentLabel = '0:v';
+    let filterIndex = 0;
+
+    // Add logo overlay if present
+    if (logo && logoSize) {
+      const logoInput = 1 + (voiceOver ? 1 : 0) + (backgroundMusic ? 1 : 0);
+      filters.push(`[${currentLabel}][${logoInput}:v]overlay=${logoSize.position.x}:${logoSize.position.y}[v${filterIndex}]`);
+      currentLabel = `v${filterIndex}`;
+      filterIndex++;
+    }
+
+    // Add review card if present
+    if (reviewImage && reviewCardSize) {
+      const reviewInput = 1 + (voiceOver ? 1 : 0) + (backgroundMusic ? 1 : 0) + (logo ? 1 : 0);
+      filters.push(`[${currentLabel}][${reviewInput}:v]overlay=${reviewCardSize.position.x}:${reviewCardSize.position.y}[v${filterIndex}]`);
+      currentLabel = `v${filterIndex}`;
+      filterIndex++;
+    }
+
+    // Audio mixing
+    const audioInputs = [];
+    if (voiceOver) audioInputs.push('1:a');
+    if (backgroundMusic) {
+      const musicIdx = 1 + (voiceOver ? 1 : 0);
+      audioInputs.push(`[${musicIdx}:a]`);
+    }
+
+    if (audioInputs.length > 0) {
+      filters.push(`${audioInputs.join('')}amix=inputs=${audioInputs.length}:duration=first[audio]`);
+    } else {
+      filters.push(`anullsrc=r=44100:cl=stereo[audio]`);
+    }
+
+    if (filters.length > 0) {
+      command.complexFilter(filters);
+      command.outputOptions([
+        '-map', `[${currentLabel}]`,
+        '-map', '[audio]'
+      ]);
+    }
+
+    command.outputOptions([
+      '-c:v', 'libx264',
+      '-preset', preset,
+      '-crf', quality,
+      '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac',
+      '-b:a', '192k',
+      '-t', duration.toString()
+    ])
+    .output(outputPath);
 
     return command;
   }
