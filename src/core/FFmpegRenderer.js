@@ -266,28 +266,31 @@ class FFmpegRenderer {
 
     // Build simpler filter for overlays and audio
     const filters = [];
-    let currentLabel = '0:v';
+    let currentVideoLabel = '0:v'; // Input stream, not filter label
+    let hasVideoFilters = false;
     let filterIndex = 0;
 
     // Add logo overlay if present
     if (logo && logoSize) {
       const logoInput = 1 + (voiceOver ? 1 : 0) + (backgroundMusic ? 1 : 0);
-      filters.push(`[${currentLabel}][${logoInput}:v]overlay=${logoSize.position.x}:${logoSize.position.y}[v${filterIndex}]`);
-      currentLabel = `v${filterIndex}`;
+      filters.push(`[${currentVideoLabel}][${logoInput}:v]overlay=${logoSize.position.x}:${logoSize.position.y}[v${filterIndex}]`);
+      currentVideoLabel = `v${filterIndex}`;
+      hasVideoFilters = true;
       filterIndex++;
     }
 
     // Add review card if present
     if (reviewImage && reviewCardSize) {
       const reviewInput = 1 + (voiceOver ? 1 : 0) + (backgroundMusic ? 1 : 0) + (logo ? 1 : 0);
-      filters.push(`[${currentLabel}][${reviewInput}:v]overlay=${reviewCardSize.position.x}:${reviewCardSize.position.y}[v${filterIndex}]`);
-      currentLabel = `v${filterIndex}`;
+      filters.push(`[${currentVideoLabel}][${reviewInput}:v]overlay=${reviewCardSize.position.x}:${reviewCardSize.position.y}[v${filterIndex}]`);
+      currentVideoLabel = `v${filterIndex}`;
+      hasVideoFilters = true;
       filterIndex++;
     }
 
     // Audio mixing
     const audioInputs = [];
-    if (voiceOver) audioInputs.push('1:a');
+    if (voiceOver) audioInputs.push('[1:a]');
     if (backgroundMusic) {
       const musicIdx = 1 + (voiceOver ? 1 : 0);
       audioInputs.push(`[${musicIdx}:a]`);
@@ -301,10 +304,15 @@ class FFmpegRenderer {
 
     if (filters.length > 0) {
       command.complexFilter(filters);
-      command.outputOptions([
-        '-map', `[${currentLabel}]`,
-        '-map', '[audio]'
-      ]);
+
+      // Map video: use filter label if we applied filters, otherwise use input stream
+      if (hasVideoFilters) {
+        command.outputOptions(['-map', `[${currentVideoLabel}]`]);
+      } else {
+        command.outputOptions(['-map', currentVideoLabel]); // No brackets - it's an input stream
+      }
+
+      command.outputOptions(['-map', '[audio]']);
     }
 
     command.outputOptions([
