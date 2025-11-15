@@ -196,11 +196,38 @@ class FFmpegRenderer {
       const segmentPath = path.join(tempDir, `segment_${i}.mp4`);
       segments.push(segmentPath);
 
+      // Get image dimensions for proper mode selection
+      const imgDimensions = await this.getImageDimensions(img);
+
+      // Build proper filter based on image mode
+      let videoFilter;
+      if (imageMode === this.IMAGE_MODES.CROP_FILL) {
+        // Crop to fill - scale up and crop
+        videoFilter = `scale=${videoWidth}:${videoHeight}:force_original_aspect_ratio=increase,crop=${videoWidth}:${videoHeight}`;
+      } else if (imageMode === this.IMAGE_MODES.BLUR_BACKGROUND) {
+        // Blur background mode - preserve full image with blurred background
+        const blurStrength = 30;
+        videoFilter = `split[bg][fg];[bg]scale=${videoWidth*1.2}:${videoHeight*1.2}:force_original_aspect_ratio=increase,crop=${videoWidth}:${videoHeight},boxblur=${blurStrength}:${blurStrength}[blurred];[fg]scale=${videoWidth}:${videoHeight}:force_original_aspect_ratio=decrease[img];[blurred][img]overlay=(W-w)/2:(H-h)/2`;
+      } else {
+        // Letterbox (default) - full image with bars
+        const videoAspectRatio = videoWidth / videoHeight;
+        const imageAspectRatio = imgDimensions.width / imgDimensions.height;
+        const aspectRatioSimilarity = Math.abs(videoAspectRatio - imageAspectRatio) / videoAspectRatio;
+
+        if (aspectRatioSimilarity < 0.15) {
+          // Similar aspect ratios - fill frame
+          videoFilter = `scale=${videoWidth}:${videoHeight}:force_original_aspect_ratio=increase,crop=${videoWidth}:${videoHeight}`;
+        } else {
+          // Different aspect ratios - letterbox with bars
+          videoFilter = `scale=${videoWidth}:${videoHeight}:force_original_aspect_ratio=decrease,pad=${videoWidth}:${videoHeight}:(ow-iw)/2:(oh-ih)/2:black`;
+        }
+      }
+
       await new Promise((resolve, reject) => {
         ffmpeg(img)
           .inputOptions(['-loop', '1', '-t', segmentDuration.toString()])
           .outputOptions([
-            '-vf', `scale=${videoWidth}:${videoHeight}:force_original_aspect_ratio=decrease,pad=${videoWidth}:${videoHeight}:(ow-iw)/2:(oh-ih)/2:black`,
+            '-vf', videoFilter,
             '-c:v', 'libx264',
             '-preset', 'ultrafast',  // Fast encoding for segments
             '-pix_fmt', 'yuv420p',
