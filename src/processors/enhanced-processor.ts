@@ -125,14 +125,12 @@ export async function processEnhancedVideo(data: EnhancementData) {
         throw new Error('Enhanced video was not created')
       }
       
-      // Upload to R2/S3 using working uploadToS3 function
+      // Upload to R2/S3
       logger.info('STEP D: Starting upload to R2/S3')
       const s3Key = `enhanced-videos/${organizationId}/${videoId}-${platform}.mp4`
-      const videoBuffer = await fs.readFile(enhancedVideoPath)
-      logger.info('STEP E: Video loaded into buffer', { bufferSize: videoBuffer.length })
 
-      await uploadToR2(s3Key, videoBuffer as any, 'video/mp4')
-      logger.info('STEP F: Upload to R2 completed', { s3Key })
+      await uploadToR2(enhancedVideoPath, s3Key, 'video/mp4')
+      logger.info('STEP E: Upload to R2 completed', { s3Key })
       
       const videoUrl = `https://your-r2-domain.com/${s3Key}` // Will be replaced with signed URL
       
