@@ -316,7 +316,7 @@ class FFmpegRenderer {
 
     command.outputOptions([
       '-map', '[final_video]',
-      '-map', '[final_audio]',
+      '-map', '[audio]', // buildFilterComplex creates [audio], not [final_audio]
       '-c:v', 'libx264',
       '-preset', preset,
       '-crf', quality,
