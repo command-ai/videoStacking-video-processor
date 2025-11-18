@@ -93,21 +93,19 @@ class FFmpegRenderer {
     // Adjust transition duration based on image count to reduce memory usage
     // More images = shorter transitions to avoid "Resource temporarily unavailable" errors
     const adjustedTransition = { ...transition };
-    if (images.length > 15) {
-      adjustedTransition.duration = 0.3; // Shorter transitions for many images
-    } else if (images.length > 10) {
-      adjustedTransition.duration = 0.4;
+    if (images.length > 8) {
+      adjustedTransition.duration = 0.25; // Very short transitions for 9-10 images
     } else if (images.length > 5) {
-      adjustedTransition.duration = 0.5;
+      adjustedTransition.duration = 0.4; // Shorter transitions for 6-8 images
     } else {
-      adjustedTransition.duration = 0.7; // Longer, smoother transitions for few images
+      adjustedTransition.duration = 0.6; // Longer, smoother transitions for few images
     }
 
-    // Use two-pass approach for very large image counts (>20) to avoid Railway memory limits
-    // Railway has ~512MB-8GB RAM. Each xfade transition buffers ~2s of frames.
-    // 13+ images with transitions can exceed memory limits, causing "Resource temporarily unavailable"
-    if (images.length > 20) {
-      console.log(`⚠️  Using two-pass method for ${images.length} images (no transitions, but more reliable)`);
+    // Use two-pass approach for >10 images to avoid Railway memory limits
+    // Railway memory constraints: Even with short transitions, 13+ images exceed available RAM
+    // Error: "Resource temporarily unavailable" = out of memory during xfade filter processing
+    if (images.length > 10) {
+      console.log(`⚠️  Using two-pass method for ${images.length} images (no transitions, but reliable)`);
       return this.buildCommandTwoPass(options);
     }
 
