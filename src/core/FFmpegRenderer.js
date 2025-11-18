@@ -90,8 +90,9 @@ class FFmpegRenderer {
       transition = { type: 'fade', duration: 0.5 } // Default fade transition
     } = options;
 
-    // For >8 images, use memory-efficient two-pass approach to avoid Railway resource limits
-    if (images.length > 8) {
+    // Use two-pass approach for very large image counts (>30) to avoid filter graph complexity
+    // Note: Two-pass sacrifices transitions for reliability. Consider removing if not needed.
+    if (images.length > 30) {
       return this.buildCommandTwoPass(options);
     }
 
