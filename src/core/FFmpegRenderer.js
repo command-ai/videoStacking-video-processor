@@ -69,6 +69,21 @@ class FFmpegRenderer {
   }
 
   /**
+   * Get video duration
+   */
+  async getVideoDuration(videoPath) {
+    return new Promise((resolve, reject) => {
+      ffmpeg.ffprobe(videoPath, (err, metadata) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve(metadata.format.duration);
+      });
+    });
+  }
+
+  /**
    * Build FFmpeg command - MEMORY-EFFICIENT TWO-PASS for many images
    */
   async buildCommand(options) {
@@ -101,12 +116,12 @@ class FFmpegRenderer {
       adjustedTransition.duration = 0.6; // Longer, smoother transitions for few images
     }
 
-    // Use two-pass approach for >10 images to avoid Railway memory limits
-    // Railway memory constraints: Even with short transitions, 13+ images exceed available RAM
-    // Error: "Resource temporarily unavailable" = out of memory during xfade filter processing
+    // Use chunked rendering for >10 images to maintain transitions while staying within memory limits
+    // Chunked rendering: Process images in 10-image segments, then concatenate with transitions
+    // This maintains high quality, transitions, and music looping for unlimited images
     if (images.length > 10) {
-      console.log(`⚠️  Using two-pass method for ${images.length} images (no transitions, but reliable)`);
-      return this.buildCommandTwoPass(options);
+      console.log(`🎬 Using chunked rendering for ${images.length} images (transitions + unlimited scale)`);
+      return this.buildCommandChunked(options);
     }
 
     const command = ffmpeg();
@@ -173,6 +188,359 @@ class FFmpegRenderer {
       .output(outputPath);
 
     return command;
+  }
+
+  /**
+   * Build command using CHUNKED RENDERING for unlimited images with transitions
+   * Splits images into chunks of 10, renders each with transitions, then concatenates
+   * Maintains quality, transitions, and music looping while staying within memory limits
+   */
+  async buildCommandChunked(options) {
+    const {
+      images,
+      voiceOver,
+      backgroundMusic,
+      logo,
+      reviewImage,
+      outputPath,
+      videoWidth,
+      videoHeight,
+      duration,
+      logoSize,
+      reviewCardSize,
+      preset = 'medium',
+      quality = 23,
+      imageMode = this.defaultImageMode,
+      transition = { type: 'fade', duration: 0.5 }
+    } = options;
+
+    const CHUNK_SIZE = 10;
+    const numChunks = Math.ceil(images.length / CHUNK_SIZE);
+    const tempDir = path.dirname(outputPath);
+    const chunkPaths = [];
+
+    console.log(`📦 Splitting ${images.length} images into ${numChunks} chunks of ${CHUNK_SIZE}`);
+
+    // Step 1: Render each chunk with transitions
+    for (let chunkIndex = 0; chunkIndex < numChunks; chunkIndex++) {
+      const startIdx = chunkIndex * CHUNK_SIZE;
+      const endIdx = Math.min(startIdx + CHUNK_SIZE, images.length);
+      const chunkImages = images.slice(startIdx, endIdx);
+      const chunkDuration = (duration * chunkImages.length) / images.length;
+
+      console.log(`  🎬 Rendering chunk ${chunkIndex + 1}/${numChunks} (images ${startIdx + 1}-${endIdx})`);
+
+      const chunkPath = path.join(tempDir, `chunk_${chunkIndex}.mp4`);
+      chunkPaths.push(chunkPath);
+
+      // Render this chunk with transitions using existing logic
+      await this.renderChunk({
+        images: chunkImages,
+        outputPath: chunkPath,
+        videoWidth,
+        videoHeight,
+        duration: chunkDuration,
+        preset,
+        quality,
+        imageMode,
+        transition
+      });
+    }
+
+    // Step 2: Concatenate chunks with crossfade transitions
+    console.log(`🔗 Concatenating ${numChunks} chunks with crossfade transitions...`);
+    await this.concatenateChunksWithTransitions({
+      chunkPaths,
+      outputPath,
+      voiceOver,
+      backgroundMusic,
+      logo,
+      reviewImage,
+      logoSize,
+      reviewCardSize,
+      duration,
+      videoWidth,
+      videoHeight,
+      preset,
+      quality,
+      transition
+    });
+
+    // Cleanup chunk files
+    for (const chunkPath of chunkPaths) {
+      try {
+        await fs.unlink(chunkPath);
+      } catch (err) {
+        console.warn(`Failed to delete chunk file ${chunkPath}:`, err.message);
+      }
+    }
+
+    console.log(`✅ Chunked rendering complete: ${images.length} images → ${outputPath}`);
+
+    // Return a dummy command since we've already generated the file
+    return ffmpeg().input(outputPath).output('/dev/null').outputOptions(['-f', 'null']);
+  }
+
+  /**
+   * Render a single chunk of images with transitions
+   */
+  async renderChunk(options) {
+    const {
+      images,
+      outputPath,
+      videoWidth,
+      videoHeight,
+      duration,
+      preset,
+      quality,
+      imageMode,
+      transition
+    } = options;
+
+    const command = ffmpeg();
+
+    // Add all image inputs
+    images.forEach(img => command.input(img));
+
+    const filters = await this.buildFilterComplex({
+      images,
+      videoWidth,
+      videoHeight,
+      duration,
+      imageMode,
+      transition,
+      fps: 30
+    });
+
+    command.complexFilter(filters);
+
+    command.outputOptions([
+      '-map', '[final_video]',
+      '-map', '[final_audio]',
+      '-c:v', 'libx264',
+      '-preset', preset,
+      '-crf', quality,
+      '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac',
+      '-b:a', '192k',
+      '-t', duration.toString()
+    ])
+    .output(outputPath);
+
+    return new Promise((resolve, reject) => {
+      command
+        .on('end', () => resolve(outputPath))
+        .on('error', reject)
+        .run();
+    });
+  }
+
+  /**
+   * Concatenate chunks with crossfade transitions between segments
+   */
+  async concatenateChunksWithTransitions(options) {
+    const {
+      chunkPaths,
+      outputPath,
+      voiceOver,
+      backgroundMusic,
+      logo,
+      reviewImage,
+      logoSize,
+      reviewCardSize,
+      duration,
+      videoWidth,
+      videoHeight,
+      preset,
+      quality,
+      transition
+    } = options;
+
+    const tempDir = path.dirname(outputPath);
+    const transitionDuration = transition.duration || 0.5;
+
+    // If only one chunk, just add audio/overlays and return
+    if (chunkPaths.length === 1) {
+      return this.addAudioAndOverlays({
+        inputPath: chunkPaths[0],
+        outputPath,
+        voiceOver,
+        backgroundMusic,
+        logo,
+        reviewImage,
+        logoSize,
+        reviewCardSize,
+        duration,
+        videoWidth,
+        videoHeight,
+        preset,
+        quality
+      });
+    }
+
+    // Progressively concatenate chunks with crossfade
+    let currentPath = chunkPaths[0];
+
+    for (let i = 1; i < chunkPaths.length; i++) {
+      const nextChunk = chunkPaths[i];
+      const tempOutput = path.join(tempDir, `concat_temp_${i}.mp4`);
+
+      console.log(`  🔗 Merging chunk ${i}/${chunkPaths.length - 1} with crossfade...`);
+
+      // Get duration of first video to calculate correct offset
+      const firstVideoDuration = await this.getVideoDuration(currentPath);
+      const xfadeOffset = firstVideoDuration - transitionDuration;
+
+      await new Promise((resolve, reject) => {
+        const command = ffmpeg()
+          .input(currentPath)
+          .input(nextChunk)
+          .complexFilter([
+            `[0:v][1:v]xfade=transition=${transition.type || 'fade'}:duration=${transitionDuration}:offset=${xfadeOffset}[v]`,
+            '[0:a][1:a]acrossfade=d=' + transitionDuration + '[a]'
+          ])
+          .outputOptions([
+            '-map', '[v]',
+            '-map', '[a]',
+            '-c:v', 'libx264',
+            '-preset', 'veryfast', // Fast for intermediate files
+            '-crf', quality,
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac',
+            '-b:a', '192k'
+          ])
+          .output(tempOutput)
+          .on('end', () => {
+            // Clean up previous temp file
+            if (currentPath !== chunkPaths[0]) {
+              fs.unlink(currentPath).catch(() => {});
+            }
+            currentPath = tempOutput;
+            resolve();
+          })
+          .on('error', reject)
+          .run();
+      });
+    }
+
+    // Add audio and overlays to final concatenated video
+    await this.addAudioAndOverlays({
+      inputPath: currentPath,
+      outputPath,
+      voiceOver,
+      backgroundMusic,
+      logo,
+      reviewImage,
+      logoSize,
+      reviewCardSize,
+      duration,
+      videoWidth,
+      videoHeight,
+      preset,
+      quality
+    });
+
+    // Clean up final temp file
+    if (currentPath !== chunkPaths[0]) {
+      await fs.unlink(currentPath).catch(() => {});
+    }
+  }
+
+  /**
+   * Add audio and overlays to a rendered video
+   */
+  async addAudioAndOverlays(options) {
+    const {
+      inputPath,
+      outputPath,
+      voiceOver,
+      backgroundMusic,
+      logo,
+      reviewImage,
+      logoSize,
+      reviewCardSize,
+      duration,
+      videoWidth,
+      videoHeight,
+      preset,
+      quality
+    } = options;
+
+    const command = ffmpeg()
+      .input(inputPath);
+
+    const filters = [];
+    let videoLabel = '0:v';
+    let audioInputs = ['0:a'];
+    let inputIndex = 1;
+
+    // Add voiceover
+    if (voiceOver) {
+      command.input(voiceOver);
+      audioInputs.push(`${inputIndex}:a`);
+      inputIndex++;
+    }
+
+    // Add background music (loop if necessary)
+    if (backgroundMusic) {
+      command.input(backgroundMusic).inputOptions(['-stream_loop', '-1']); // Loop music
+      const musicDuration = await this.getAudioDuration(backgroundMusic);
+      filters.push(`[${inputIndex}:a]afade=t=out:st=${duration - 1.5}:d=1.5,volume=0.15[music]`);
+      audioInputs.push('[music]');
+      inputIndex++;
+    }
+
+    // Mix audio
+    if (audioInputs.length > 1) {
+      filters.push(`${audioInputs.join('')}amix=inputs=${audioInputs.length}:duration=first[final_audio]`);
+    } else {
+      filters.push(`${audioInputs[0]}acopy[final_audio]`);
+    }
+
+    // Add logo overlay
+    if (logo && logoSize) {
+      command.input(logo);
+      filters.push(`[${inputIndex}:v]scale=${logoSize.width}:${logoSize.height}[logo_scaled]`);
+      filters.push(`[${videoLabel}][logo_scaled]overlay=${logoSize.x}:${logoSize.y}[with_logo]`);
+      videoLabel = 'with_logo';
+      inputIndex++;
+    }
+
+    // Add review card overlay
+    if (reviewImage && reviewCardSize) {
+      command.input(reviewImage);
+      const reviewStart = 5;
+      const reviewEnd = Math.min(20, duration * 0.3);
+      filters.push(`[${inputIndex}:v]scale=${reviewCardSize.width}:${reviewCardSize.height}[review_scaled]`);
+      filters.push(`[${videoLabel}][review_scaled]overlay=${reviewCardSize.x}:${reviewCardSize.y}:enable='between(t,${reviewStart},${reviewEnd})'[final_video]`);
+      videoLabel = 'final_video';
+    } else {
+      filters.push(`[${videoLabel}]copy[final_video]`);
+    }
+
+    if (filters.length > 0) {
+      command.complexFilter(filters);
+    }
+
+    command.outputOptions([
+      '-map', `[${videoLabel === 'final_video' ? videoLabel : 'final_video'}]`,
+      '-map', '[final_audio]',
+      '-c:v', 'libx264',
+      '-preset', preset,
+      '-crf', quality,
+      '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac',
+      '-b:a', '192k',
+      '-t', duration.toString()
+    ])
+    .output(outputPath);
+
+    return new Promise((resolve, reject) => {
+      command
+        .on('end', resolve)
+        .on('error', reject)
+        .run();
+    });
   }
 
   /**
