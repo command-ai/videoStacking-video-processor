@@ -90,9 +90,24 @@ class FFmpegRenderer {
       transition = { type: 'fade', duration: 0.5 } // Default fade transition
     } = options;
 
-    // Use two-pass approach for very large image counts (>30) to avoid filter graph complexity
-    // Note: Two-pass sacrifices transitions for reliability. Consider removing if not needed.
-    if (images.length > 30) {
+    // Adjust transition duration based on image count to reduce memory usage
+    // More images = shorter transitions to avoid "Resource temporarily unavailable" errors
+    const adjustedTransition = { ...transition };
+    if (images.length > 15) {
+      adjustedTransition.duration = 0.3; // Shorter transitions for many images
+    } else if (images.length > 10) {
+      adjustedTransition.duration = 0.4;
+    } else if (images.length > 5) {
+      adjustedTransition.duration = 0.5;
+    } else {
+      adjustedTransition.duration = 0.7; // Longer, smoother transitions for few images
+    }
+
+    // Use two-pass approach for very large image counts (>20) to avoid Railway memory limits
+    // Railway has ~512MB-8GB RAM. Each xfade transition buffers ~2s of frames.
+    // 13+ images with transitions can exceed memory limits, causing "Resource temporarily unavailable"
+    if (images.length > 20) {
+      console.log(`⚠️  Using two-pass method for ${images.length} images (no transitions, but more reliable)`);
       return this.buildCommandTwoPass(options);
     }
 
@@ -140,7 +155,7 @@ class FFmpegRenderer {
       logoIndex,
       reviewIndex,
       imageMode,
-      transition
+      transition: adjustedTransition // Use adjusted transition duration
     });
 
     // Apply filter and output options
