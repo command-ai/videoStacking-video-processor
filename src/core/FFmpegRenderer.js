@@ -116,10 +116,13 @@ class FFmpegRenderer {
       adjustedTransition.duration = 0.6; // Longer, smoother transitions for few images
     }
 
-    // Use single-pass rendering for up to 30 images - simpler and more reliable
-    // Only use chunked rendering for very large image sets (>30 images)
-    if (images.length > 30) {
-      console.log(`🎬 Using chunked rendering for ${images.length} images (transitions + unlimited scale)`);
+    // Use chunked rendering for >6 images with letterbox/blur (memory intensive)
+    // Use single-pass for crop mode or <=6 images
+    const memoryIntensiveMode = imageMode !== this.IMAGE_MODES.CROP_FILL;
+    const threshold = memoryIntensiveMode ? 6 : 12;
+
+    if (images.length > threshold) {
+      console.log(`🎬 Using chunked rendering for ${images.length} images (${imageMode} mode, threshold: ${threshold})`);
       return this.buildCommandChunked(options);
     }
 
@@ -213,12 +216,13 @@ class FFmpegRenderer {
       transition = { type: 'fade', duration: 0.5 }
     } = options;
 
-    const CHUNK_SIZE = 8; // Reduced from 10 to stay within Railway memory limits
+    // Smaller chunks for memory-intensive modes (letterbox/blur)
+    const CHUNK_SIZE = imageMode !== this.IMAGE_MODES.CROP_FILL ? 5 : 8;
     const numChunks = Math.ceil(images.length / CHUNK_SIZE);
     const tempDir = path.dirname(outputPath);
     const chunkPaths = [];
 
-    console.log(`📦 Splitting ${images.length} images into ${numChunks} chunks of up to ${CHUNK_SIZE}`);
+    console.log(`📦 Splitting ${images.length} images into ${numChunks} chunks of up to ${CHUNK_SIZE} (${imageMode} mode)`);
 
     // Step 1: Render each chunk with transitions
     for (let chunkIndex = 0; chunkIndex < numChunks; chunkIndex++) {
@@ -401,21 +405,15 @@ class FFmpegRenderer {
     }
 
     const tempConcatenated = path.join(tempDir, 'concatenated.mp4');
+    const concatListPath = path.join(tempDir, 'concat_chunks.txt');
+    await fs.writeFile(concatListPath, chunkPaths.map(p => `file '${p}'`).join('\n'));
 
-    // Use concat filter instead of demuxer - more reliable, handles format differences
-    const command = ffmpeg();
-    chunkPaths.forEach(chunk => command.input(chunk));
-
-    // Build concat filter: [0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]
-    const inputStreams = chunkPaths.flatMap((_, i) => [`[${i}:v]`, `[${i}:a]`]);
-    const concatFilter = `${inputStreams.join('')}concat=n=${chunkPaths.length}:v=1:a=1[v][a]`;
-
+    // Use concat demuxer with re-encoding (not -c copy) for reliability
     await new Promise((resolve, reject) => {
-      command
-        .complexFilter([concatFilter])
+      ffmpeg()
+        .input(concatListPath)
+        .inputOptions(['-f', 'concat', '-safe', '0'])
         .outputOptions([
-          '-map', '[v]',
-          '-map', '[a]',
           '-c:v', 'libx264',
           '-preset', preset,
           '-crf', quality,
@@ -425,8 +423,7 @@ class FFmpegRenderer {
         ])
         .output(tempConcatenated)
         .on('start', (commandLine) => {
-          console.log(`  ▶️  Concat filter: ${concatFilter}`);
-          console.log(`  ▶️  Concat command: ${commandLine.substring(0, 300)}...`);
+          console.log(`  ▶️  Concat demuxer (re-encode): ${commandLine.substring(0, 300)}...`);
         })
         .on('end', resolve)
         .on('error', reject)
