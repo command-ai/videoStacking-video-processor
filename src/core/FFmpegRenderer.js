@@ -329,8 +329,17 @@ class FFmpegRenderer {
 
     return new Promise((resolve, reject) => {
       command
-        .on('end', () => resolve(outputPath))
-        .on('error', reject)
+        .on('start', (commandLine) => {
+          console.log(`    ▶️  Chunk FFmpeg: ${commandLine.substring(0, 200)}...`);
+        })
+        .on('end', () => {
+          console.log(`    ✅ Chunk rendered: ${outputPath}`);
+          resolve(outputPath);
+        })
+        .on('error', (err) => {
+          console.error(`    ❌ Chunk render failed:`, err.message);
+          reject(err);
+        })
         .run();
     });
   }
@@ -381,6 +390,16 @@ class FFmpegRenderer {
     // Simple concatenation without crossfade between chunks
     // Each chunk already has smooth transitions internally
     console.log(`  🔗 Concatenating ${chunkPaths.length} chunks...`);
+
+    // Verify all chunks exist before concat
+    for (let i = 0; i < chunkPaths.length; i++) {
+      try {
+        const stats = await fs.stat(chunkPaths[i]);
+        console.log(`    ✓ Chunk ${i} exists: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+      } catch (err) {
+        throw new Error(`Chunk ${i} missing: ${chunkPaths[i]} - ${err.message}`);
+      }
+    }
 
     const concatListPath = path.join(tempDir, 'concat_chunks.txt');
     await fs.writeFile(concatListPath, chunkPaths.map(p => `file '${p}'`).join('\n'));
@@ -799,9 +818,9 @@ class FFmpegRenderer {
 
     // Apply transitions between image segments using xfade
     if (imageInputs.length === 1) {
-      // Single image - no transitions needed, just copy
+      // Single image - no transitions needed, use null (passthrough)
       const inputLabel = imageInputs[0].replace(/[\[\]]/g, '');
-      filters.push(`[${inputLabel}]copy[base_video]`);
+      filters.push(`[${inputLabel}]null[base_video]`);
     } else {
       // Multiple images - build xfade chain for smooth transitions
       const transitionType = transition.type || 'fade';
