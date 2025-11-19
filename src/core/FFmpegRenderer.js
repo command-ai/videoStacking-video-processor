@@ -116,10 +116,10 @@ class FFmpegRenderer {
       adjustedTransition.duration = 0.6; // Longer, smoother transitions for few images
     }
 
-    // Use chunked rendering for >10 images to maintain transitions while staying within memory limits
-    // Chunked rendering: Process images in 10-image segments, then concatenate with transitions
+    // Use chunked rendering for >8 images to maintain transitions while staying within memory limits
+    // Chunked rendering: Process images in 8-image segments, then concatenate with transitions
     // This maintains high quality, transitions, and music looping for unlimited images
-    if (images.length > 10) {
+    if (images.length > 8) {
       console.log(`🎬 Using chunked rendering for ${images.length} images (transitions + unlimited scale)`);
       return this.buildCommandChunked(options);
     }
@@ -214,12 +214,12 @@ class FFmpegRenderer {
       transition = { type: 'fade', duration: 0.5 }
     } = options;
 
-    const CHUNK_SIZE = 10;
+    const CHUNK_SIZE = 8; // Reduced from 10 to stay within Railway memory limits
     const numChunks = Math.ceil(images.length / CHUNK_SIZE);
     const tempDir = path.dirname(outputPath);
     const chunkPaths = [];
 
-    console.log(`📦 Splitting ${images.length} images into ${numChunks} chunks of ${CHUNK_SIZE}`);
+    console.log(`📦 Splitting ${images.length} images into ${numChunks} chunks of up to ${CHUNK_SIZE}`);
 
     // Step 1: Render each chunk with transitions
     for (let chunkIndex = 0; chunkIndex < numChunks; chunkIndex++) {
