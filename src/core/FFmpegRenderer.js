@@ -391,16 +391,25 @@ class FFmpegRenderer {
       const firstVideoDuration = await this.getVideoDuration(currentPath);
       const xfadeOffset = firstVideoDuration - transitionDuration;
 
+      console.log(`  📊 Debug - First video duration: ${firstVideoDuration}s, xfade offset: ${xfadeOffset}s, transition duration: ${transitionDuration}s`);
+
+      const filters = [
+        // Video crossfade
+        `[0:v][1:v]xfade=transition=${transition.type || 'fade'}:duration=${transitionDuration}:offset=${xfadeOffset}[v]`,
+        // Audio concat (not crossfade - simpler and more compatible)
+        '[0:a][1:a]concat=n=2:v=0:a=1[a]'
+      ];
+
+      console.log(`  🔍 FFmpeg filters: ${filters.join('; ')}`);
+
       await new Promise((resolve, reject) => {
         const command = ffmpeg()
           .input(currentPath)
           .input(nextChunk)
-          .complexFilter([
-            // Video crossfade
-            `[0:v][1:v]xfade=transition=${transition.type || 'fade'}:duration=${transitionDuration}:offset=${xfadeOffset}[v]`,
-            // Audio concat (not crossfade - simpler and more compatible)
-            '[0:a][1:a]concat=n=2:v=0:a=1[a]'
-          ])
+          .complexFilter(filters)
+          .on('start', (commandLine) => {
+            console.log(`  ▶️  FFmpeg command: ${commandLine}`);
+          })
           .outputOptions([
             '-map', '[v]',
             '-map', '[a]',
