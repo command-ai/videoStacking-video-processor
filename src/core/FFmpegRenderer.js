@@ -476,7 +476,8 @@ class FFmpegRenderer {
     if (audioInputs.length > 1) {
       filters.push(`${audioInputs.join('')}amix=inputs=${audioInputs.length}:duration=first[final_audio]`);
     } else {
-      filters.push(`${audioInputs[0]}acopy[final_audio]`);
+      // Use anull (audio passthrough) instead of invalid 'acopy' filter
+      filters.push(`${audioInputs[0]}anull[final_audio]`);
     }
 
     // Add logo overlay
@@ -497,8 +498,11 @@ class FFmpegRenderer {
       filters.push(`[${videoLabel}][review_scaled]overlay=${reviewCardSize.x}:${reviewCardSize.y}:enable='between(t,${reviewStart},${reviewEnd})'[final_video]`);
       videoLabel = 'final_video';
     } else {
-      filters.push(`[${videoLabel}]copy[final_video]`);
+      // Use null (video passthrough) instead of invalid 'copy' filter
+      filters.push(`[${videoLabel}]null[final_video]`);
     }
+
+    console.log(`  🔍 Audio/Overlay filters: ${filters.join('; ')}`);
 
     if (filters.length > 0) {
       command.complexFilter(filters);
@@ -519,6 +523,9 @@ class FFmpegRenderer {
 
     return new Promise((resolve, reject) => {
       command
+        .on('start', (commandLine) => {
+          console.log(`  ▶️  Audio/Overlay command: ${commandLine}`);
+        })
         .on('end', resolve)
         .on('error', reject)
         .run();
