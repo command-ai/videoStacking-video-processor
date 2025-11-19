@@ -401,21 +401,33 @@ class FFmpegRenderer {
       }
     }
 
-    const concatListPath = path.join(tempDir, 'concat_chunks.txt');
-    await fs.writeFile(concatListPath, chunkPaths.map(p => `file '${p}'`).join('\n'));
-
     const tempConcatenated = path.join(tempDir, 'concatenated.mp4');
 
+    // Use concat filter instead of demuxer - more reliable, handles format differences
+    const command = ffmpeg();
+    chunkPaths.forEach(chunk => command.input(chunk));
+
+    // Build concat filter: [0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]
+    const inputStreams = chunkPaths.flatMap((_, i) => [`[${i}:v]`, `[${i}:a]`]);
+    const concatFilter = `${inputStreams.join('')}concat=n=${chunkPaths.length}:v=1:a=1[v][a]`;
+
     await new Promise((resolve, reject) => {
-      ffmpeg()
-        .input(concatListPath)
-        .inputOptions(['-f', 'concat', '-safe', '0'])
+      command
+        .complexFilter([concatFilter])
         .outputOptions([
-          '-c', 'copy' // Copy without re-encoding (fast)
+          '-map', '[v]',
+          '-map', '[a]',
+          '-c:v', 'libx264',
+          '-preset', preset,
+          '-crf', quality,
+          '-pix_fmt', 'yuv420p',
+          '-c:a', 'aac',
+          '-b:a', '192k'
         ])
         .output(tempConcatenated)
         .on('start', (commandLine) => {
-          console.log(`  ▶️  Concat command: ${commandLine}`);
+          console.log(`  ▶️  Concat filter: ${concatFilter}`);
+          console.log(`  ▶️  Concat command: ${commandLine.substring(0, 300)}...`);
         })
         .on('end', resolve)
         .on('error', reject)
