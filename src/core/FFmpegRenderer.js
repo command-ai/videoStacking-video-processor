@@ -396,8 +396,10 @@ class FFmpegRenderer {
           .input(currentPath)
           .input(nextChunk)
           .complexFilter([
+            // Video crossfade
             `[0:v][1:v]xfade=transition=${transition.type || 'fade'}:duration=${transitionDuration}:offset=${xfadeOffset}[v]`,
-            '[0:a][1:a]acrossfade=d=' + transitionDuration + '[a]'
+            // Audio concat (not crossfade - simpler and more compatible)
+            '[0:a][1:a]concat=n=2:v=0:a=1[a]'
           ])
           .outputOptions([
             '-map', '[v]',
