@@ -116,13 +116,13 @@ class FFmpegRenderer {
       adjustedTransition.duration = 0.6; // Longer, smoother transitions for few images
     }
 
-    // Use chunked rendering for >6 images with letterbox/blur (memory intensive)
-    // Use single-pass for crop mode or <=6 images
-    const memoryIntensiveMode = imageMode !== this.IMAGE_MODES.CROP_FILL;
-    const threshold = memoryIntensiveMode ? 6 : 12;
+    // xfade filter has PROVEN runaway memory issues with >6 images
+    // Use batch rendering for any video with transitions and >6 images
+    // Research shows memory exhaustion at ~50 images even on 2GB RAM
+    const BATCH_THRESHOLD = 6;
 
-    if (images.length > threshold) {
-      console.log(`🎬 Using chunked rendering for ${images.length} images (${imageMode} mode, threshold: ${threshold})`);
+    if (images.length > BATCH_THRESHOLD) {
+      console.log(`🎬 Using batch rendering for ${images.length} images (xfade memory limit: ${BATCH_THRESHOLD})`);
       return this.buildCommandChunked(options);
     }
 
@@ -216,13 +216,15 @@ class FFmpegRenderer {
       transition = { type: 'fade', duration: 0.5 }
     } = options;
 
-    // Smaller chunks for memory-intensive modes (letterbox/blur)
-    const CHUNK_SIZE = imageMode !== this.IMAGE_MODES.CROP_FILL ? 5 : 8;
+    // CRITICAL: xfade has runaway memory with many images in one filter graph
+    // Solution: Render mini-batches of 2-3 images with transitions
+    // Research: https://advancedweb.hu/generating-a-crossfaded-slideshow-video-from-images-with-ffmpeg-and-melt/
+    const CHUNK_SIZE = 3; // Small batches to keep xfade filter graph manageable
     const numChunks = Math.ceil(images.length / CHUNK_SIZE);
     const tempDir = path.dirname(outputPath);
     const chunkPaths = [];
 
-    console.log(`📦 Splitting ${images.length} images into ${numChunks} chunks of up to ${CHUNK_SIZE} (${imageMode} mode)`);
+    console.log(`📦 Batch rendering: ${images.length} images → ${numChunks} mini-segments of ${CHUNK_SIZE} images (prevents xfade memory explosion)`);
 
     // Step 1: Render each chunk with transitions
     for (let chunkIndex = 0; chunkIndex < numChunks; chunkIndex++) {
@@ -321,11 +323,12 @@ class FFmpegRenderer {
       '-map', '[final_video]',
       '-map', '[audio]', // buildFilterComplex creates [audio], not [final_audio]
       '-c:v', 'libx264',
-      '-preset', preset,
-      '-crf', quality,
+      '-preset', 'ultrafast', // Fast encoding for mini-batches, re-encode in final pass
+      '-crf', '18', // Higher quality for intermediate files (re-encoded later)
       '-pix_fmt', 'yuv420p',
       '-c:a', 'aac',
       '-b:a', '192k',
+      '-threads', '1', // Prevent threading-related "Resource temporarily unavailable"
       '-t', duration.toString()
     ])
     .output(outputPath);
@@ -419,13 +422,17 @@ class FFmpegRenderer {
           '-crf', quality,
           '-pix_fmt', 'yuv420p',
           '-c:a', 'aac',
-          '-b:a', '192k'
+          '-b:a', '192k',
+          '-threads', '1' // Prevent threading issues
         ])
         .output(tempConcatenated)
         .on('start', (commandLine) => {
-          console.log(`  ▶️  Concat demuxer (re-encode): ${commandLine.substring(0, 300)}...`);
+          console.log(`  ▶️  Concat ${numChunks} mini-segments (re-encode): ${commandLine.substring(0, 300)}...`);
         })
-        .on('end', resolve)
+        .on('end', () => {
+          console.log(`  ✅ Concatenated ${numChunks} segments successfully`);
+          resolve();
+        })
         .on('error', reject)
         .run();
     });
@@ -544,6 +551,7 @@ class FFmpegRenderer {
       '-pix_fmt', 'yuv420p',
       '-c:a', 'aac',
       '-b:a', '192k',
+      '-threads', '1', // Prevent threading issues
       '-t', duration.toString()
     ])
     .output(outputPath);
