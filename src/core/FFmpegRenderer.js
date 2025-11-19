@@ -378,61 +378,32 @@ class FFmpegRenderer {
       });
     }
 
-    // Progressively concatenate chunks with crossfade
-    let currentPath = chunkPaths[0];
+    // Simple concatenation without crossfade between chunks
+    // Each chunk already has smooth transitions internally
+    console.log(`  🔗 Concatenating ${chunkPaths.length} chunks...`);
 
-    for (let i = 1; i < chunkPaths.length; i++) {
-      const nextChunk = chunkPaths[i];
-      const tempOutput = path.join(tempDir, `concat_temp_${i}.mp4`);
+    const concatListPath = path.join(tempDir, 'concat_chunks.txt');
+    await fs.writeFile(concatListPath, chunkPaths.map(p => `file '${p}'`).join('\n'));
 
-      console.log(`  🔗 Merging chunk ${i}/${chunkPaths.length - 1} with crossfade...`);
+    const tempConcatenated = path.join(tempDir, 'concatenated.mp4');
 
-      // Get duration of first video to calculate correct offset
-      const firstVideoDuration = await this.getVideoDuration(currentPath);
-      const xfadeOffset = firstVideoDuration - transitionDuration;
+    await new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(concatListPath)
+        .inputOptions(['-f', 'concat', '-safe', '0'])
+        .outputOptions([
+          '-c', 'copy' // Copy without re-encoding (fast)
+        ])
+        .output(tempConcatenated)
+        .on('start', (commandLine) => {
+          console.log(`  ▶️  Concat command: ${commandLine}`);
+        })
+        .on('end', resolve)
+        .on('error', reject)
+        .run();
+    });
 
-      console.log(`  📊 Debug - First video duration: ${firstVideoDuration}s, xfade offset: ${xfadeOffset}s, transition duration: ${transitionDuration}s`);
-
-      const filters = [
-        // Video crossfade
-        `[0:v][1:v]xfade=transition=${transition.type || 'fade'}:duration=${transitionDuration}:offset=${xfadeOffset}[v]`,
-        // Audio concat (not crossfade - simpler and more compatible)
-        '[0:a][1:a]concat=n=2:v=0:a=1[a]'
-      ];
-
-      console.log(`  🔍 FFmpeg filters: ${filters.join('; ')}`);
-
-      await new Promise((resolve, reject) => {
-        const command = ffmpeg()
-          .input(currentPath)
-          .input(nextChunk)
-          .complexFilter(filters)
-          .on('start', (commandLine) => {
-            console.log(`  ▶️  FFmpeg command: ${commandLine}`);
-          })
-          .outputOptions([
-            '-map', '[v]',
-            '-map', '[a]',
-            '-c:v', 'libx264',
-            '-preset', 'veryfast', // Fast for intermediate files
-            '-crf', quality,
-            '-pix_fmt', 'yuv420p',
-            '-c:a', 'aac',
-            '-b:a', '192k'
-          ])
-          .output(tempOutput)
-          .on('end', () => {
-            // Clean up previous temp file
-            if (currentPath !== chunkPaths[0]) {
-              fs.unlink(currentPath).catch(() => {});
-            }
-            currentPath = tempOutput;
-            resolve();
-          })
-          .on('error', reject)
-          .run();
-      });
-    }
+    const currentPath = tempConcatenated;
 
     // Add audio and overlays to final concatenated video
     await this.addAudioAndOverlays({
