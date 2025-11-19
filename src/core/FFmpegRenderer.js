@@ -116,10 +116,9 @@ class FFmpegRenderer {
       adjustedTransition.duration = 0.6; // Longer, smoother transitions for few images
     }
 
-    // Use chunked rendering for >8 images to maintain transitions while staying within memory limits
-    // Chunked rendering: Process images in 8-image segments, then concatenate with transitions
-    // This maintains high quality, transitions, and music looping for unlimited images
-    if (images.length > 8) {
+    // Use single-pass rendering for up to 30 images - simpler and more reliable
+    // Only use chunked rendering for very large image sets (>30 images)
+    if (images.length > 30) {
       console.log(`🎬 Using chunked rendering for ${images.length} images (transitions + unlimited scale)`);
       return this.buildCommandChunked(options);
     }
@@ -484,13 +483,13 @@ class FFmpegRenderer {
 
     const filters = [];
     let videoLabel = '0:v';
-    let audioInputs = ['0:a'];
+    let audioInputs = ['[0:a]'];  // Use brackets for filter graph syntax
     let inputIndex = 1;
 
     // Add voiceover
     if (voiceOver) {
       command.input(voiceOver);
-      audioInputs.push(`${inputIndex}:a`);
+      audioInputs.push(`[${inputIndex}:a]`);  // Use brackets for filter graph
       inputIndex++;
     }
 
