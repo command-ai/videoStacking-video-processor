@@ -870,10 +870,21 @@ class FFmpegRenderer {
 
     const filters = [];
     const fps = 30;
-    
-    // Use 1:1 image mapping (no cycling) - duration per image calculated in VideoGenerator
+
+    // Use 1:1 image mapping (no cycling)
     const numSegments = images.length;
-    const actualImageDuration = duration / numSegments;
+
+    // CRITICAL: Account for xfade transition overlap
+    // Each xfade transition overlaps by transition.duration, reducing total output
+    // To hit target duration, we must compensate: adjustedDuration = target + (transitions × duration)
+    const transitionDuration = transition.duration || 0.5;
+    const transitionCount = Math.max(0, numSegments - 1);
+    const totalTransitionTime = transitionCount * transitionDuration;
+    const adjustedDuration = duration + totalTransitionTime;
+    const actualImageDuration = adjustedDuration / numSegments;
+
+    console.log(`  ⏱️  Duration compensation: ${numSegments} images, ${transitionCount} transitions × ${transitionDuration}s = ${totalTransitionTime}s overlap`);
+    console.log(`  📊 Adjusted: ${duration}s target + ${totalTransitionTime}s = ${adjustedDuration}s total → ${actualImageDuration.toFixed(3)}s per image`);
     
     // Use images directly (1:1 mapping, no cycling)
     const imageSequence = images;
