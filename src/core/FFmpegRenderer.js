@@ -220,23 +220,53 @@ class FFmpegRenderer {
     // Solution: Render mini-batches of 2-3 images with transitions
     // Research: https://advancedweb.hu/generating-a-crossfaded-slideshow-video-from-images-with-ffmpeg-and-melt/
     const CHUNK_SIZE = 3; // Small batches to keep xfade filter graph manageable
-    const numChunks = Math.ceil(images.length / CHUNK_SIZE);
+    const OVERLAP = 1; // Overlap last image of chunk N with first image of chunk N+1 for seamless transitions
     const tempDir = path.dirname(outputPath);
     const chunkPaths = [];
+    const chunkDurations = [];
 
-    console.log(`📦 Batch rendering: ${images.length} images → ${numChunks} mini-segments of ${CHUNK_SIZE} images (prevents xfade memory explosion)`);
+    // Calculate chunks with overlap
+    const chunks = [];
+    let idx = 0;
+    while (idx < images.length) {
+      const chunkImages = [];
+      const isFirstChunk = chunks.length === 0;
+
+      // For non-first chunks, include overlap image from previous chunk
+      if (!isFirstChunk && idx > 0) {
+        chunkImages.push(images[idx - OVERLAP]);
+      }
+
+      // Add CHUNK_SIZE images (or remaining images)
+      const remaining = images.length - idx;
+      const count = Math.min(CHUNK_SIZE, remaining);
+      for (let i = 0; i < count; i++) {
+        chunkImages.push(images[idx + i]);
+      }
+
+      chunks.push({
+        images: chunkImages,
+        startIdx: idx,
+        hasOverlap: !isFirstChunk
+      });
+
+      idx += count;
+    }
+
+    const numChunks = chunks.length;
+    console.log(`📦 Batch rendering: ${images.length} images → ${numChunks} mini-segments with overlap (prevents xfade memory explosion)`);
 
     // Step 1: Render each chunk with transitions
     for (let chunkIndex = 0; chunkIndex < numChunks; chunkIndex++) {
-      const startIdx = chunkIndex * CHUNK_SIZE;
-      const endIdx = Math.min(startIdx + CHUNK_SIZE, images.length);
-      const chunkImages = images.slice(startIdx, endIdx);
+      const chunk = chunks[chunkIndex];
+      const chunkImages = chunk.images;
       const chunkDuration = (duration * chunkImages.length) / images.length;
 
-      console.log(`  🎬 Rendering chunk ${chunkIndex + 1}/${numChunks} (images ${startIdx + 1}-${endIdx})`);
+      console.log(`  🎬 Rendering chunk ${chunkIndex + 1}/${numChunks} (${chunkImages.length} images${chunk.hasOverlap ? ', 1 overlap' : ''})`);
 
       const chunkPath = path.join(tempDir, `chunk_${chunkIndex}.mp4`);
       chunkPaths.push(chunkPath);
+      chunkDurations.push(chunkDuration);
 
       // Render this chunk with transitions using existing logic
       await this.renderChunk({
@@ -256,6 +286,7 @@ class FFmpegRenderer {
     console.log(`🔗 Concatenating ${numChunks} chunks with crossfade transitions...`);
     await this.concatenateChunksWithTransitions({
       chunkPaths,
+      chunkDurations,
       outputPath,
       voiceOver,
       backgroundMusic,
@@ -374,6 +405,7 @@ class FFmpegRenderer {
   async concatenateChunksWithTransitions(options) {
     const {
       chunkPaths,
+      chunkDurations,
       outputPath,
       voiceOver,
       backgroundMusic,
@@ -390,7 +422,7 @@ class FFmpegRenderer {
     } = options;
 
     const tempDir = path.dirname(outputPath);
-    const transitionDuration = transition.duration || 0.5;
+    const transitionDuration = transition?.duration || 0.5;
 
     // If only one chunk, just add audio/overlays and return
     if (chunkPaths.length === 1) {
@@ -411,9 +443,8 @@ class FFmpegRenderer {
       });
     }
 
-    // Simple concatenation without crossfade between chunks
-    // Each chunk already has smooth transitions internally
-    console.log(`  🔗 Concatenating ${chunkPaths.length} chunks...`);
+    // Concatenate chunks with xfade transitions at overlap points
+    console.log(`  🔗 Concatenating ${chunkPaths.length} chunks with xfade...`);
 
     // Verify all chunks exist before concat
     for (let i = 0; i < chunkPaths.length; i++) {
@@ -426,45 +457,76 @@ class FFmpegRenderer {
     }
 
     const tempConcatenated = path.join(tempDir, 'concatenated.mp4');
-    const concatListPath = path.join(tempDir, 'concat_chunks.txt');
-    await fs.writeFile(concatListPath, chunkPaths.map(p => `file '${p}'`).join('\n'));
 
-    // Use concat demuxer with re-encoding (not -c copy) for reliability
+    // Build xfade filter chain for seamless transitions between chunks
+    // Each chunk overlaps by 1 image, so we apply xfade at the overlap point
+    const filterParts = [];
+    let cumulativeDuration = 0;
+
+    // Build xfade chain: [0:v][1:v]xfade[v1]; [v1][2:v]xfade[v2]; etc.
+    for (let i = 1; i < chunkPaths.length; i++) {
+      const prevDuration = chunkDurations[i - 1];
+      cumulativeDuration += prevDuration;
+
+      const inputLabel1 = i === 1 ? '[0:v]' : `[v${i-1}]`;
+      const inputLabel2 = `[${i}:v]`;
+      const outputLabel = `[v${i}]`;
+
+      // xfade offset is at the end of the previous chunk minus transition duration
+      const offset = cumulativeDuration - transitionDuration;
+
+      filterParts.push(`${inputLabel1}${inputLabel2}xfade=transition=fade:duration=${transitionDuration}:offset=${offset}${outputLabel}`);
+    }
+
+    const filterComplex = filterParts.join(';');
+    const finalOutput = chunkPaths.length > 1 ? `[v${chunkPaths.length - 1}]` : '[0:v]';
+
+    console.log(`  🔗 Building xfade chain for ${chunkPaths.length} chunks`);
+
+    // Use xfade filter chain to concatenate with transitions
     await new Promise((resolve, reject) => {
       let ffmpegStderr = [];
+      const command = ffmpeg();
 
-      ffmpeg()
-        .input(concatListPath)
-        .inputOptions(['-f', 'concat', '-safe', '0'])
+      // Add all chunks as inputs
+      chunkPaths.forEach(chunkPath => {
+        command.input(chunkPath);
+      });
+
+      command
+        .complexFilter([
+          `${filterComplex};${finalOutput}null[final_video]`,
+          '[0:a]anull[final_audio]' // Just pass through audio from first chunk
+        ])
         .outputOptions([
+          '-map', '[final_video]',
+          '-map', '[final_audio]',
           '-c:v', 'libx264',
           '-preset', preset,
           '-crf', quality,
           '-pix_fmt', 'yuv420p',
           '-c:a', 'aac',
           '-b:a', '192k',
-          '-threads', '1' // Prevent threading issues
+          '-threads', '1'
         ])
         .output(tempConcatenated)
         .on('start', (commandLine) => {
-          console.log(`  ▶️  CONCAT COMMAND:`);
+          console.log(`  ▶️  XFADE CONCAT COMMAND:`);
           console.log(`  ${commandLine}`);
         })
         .on('stderr', (stderrLine) => {
-          // Capture all stderr for debugging
           ffmpegStderr.push(stderrLine);
-          // Log important lines
           if (stderrLine.includes('error') || stderrLine.includes('Error') ||
               stderrLine.includes('failed') || stderrLine.includes('Invalid')) {
             console.error(`  🔴 FFmpeg: ${stderrLine}`);
           }
         })
         .on('end', () => {
-          console.log(`  ✅ Concatenated ${chunkPaths.length} segments successfully`);
+          console.log(`  ✅ Concatenated ${chunkPaths.length} segments with xfade successfully`);
           resolve();
         })
         .on('error', (err, stdout, stderr) => {
-          console.error(`  ❌ CONCATENATION FAILED`);
+          console.error(`  ❌ XFADE CONCATENATION FAILED`);
           console.error(`  Error message: ${err.message}`);
           console.error(`  Exit code: ${err.code || 'unknown'}`);
           if (stdout) console.error(`  STDOUT: ${stdout}`);
