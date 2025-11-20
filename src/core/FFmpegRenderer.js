@@ -334,16 +334,34 @@ class FFmpegRenderer {
     .output(outputPath);
 
     return new Promise((resolve, reject) => {
+      let ffmpegStderr = [];
+
       command
         .on('start', (commandLine) => {
-          console.log(`    ▶️  Chunk FFmpeg: ${commandLine.substring(0, 200)}...`);
+          console.log(`    ▶️  CHUNK RENDER COMMAND:`);
+          console.log(`    ${commandLine}`);
+        })
+        .on('stderr', (stderrLine) => {
+          // Capture all stderr for debugging
+          ffmpegStderr.push(stderrLine);
+          // Log important lines
+          if (stderrLine.includes('error') || stderrLine.includes('Error') ||
+              stderrLine.includes('failed') || stderrLine.includes('Invalid')) {
+            console.error(`    🔴 FFmpeg: ${stderrLine}`);
+          }
         })
         .on('end', () => {
           console.log(`    ✅ Chunk rendered: ${outputPath}`);
           resolve(outputPath);
         })
-        .on('error', (err) => {
-          console.error(`    ❌ Chunk render failed:`, err.message);
+        .on('error', (err, stdout, stderr) => {
+          console.error(`    ❌ CHUNK RENDER FAILED`);
+          console.error(`    Error message: ${err.message}`);
+          console.error(`    Exit code: ${err.code || 'unknown'}`);
+          if (stdout) console.error(`    STDOUT: ${stdout}`);
+          if (stderr) console.error(`    STDERR: ${stderr}`);
+          console.error(`    Last 10 FFmpeg stderr lines:`);
+          ffmpegStderr.slice(-10).forEach(line => console.error(`      ${line}`));
           reject(err);
         })
         .run();
@@ -413,6 +431,8 @@ class FFmpegRenderer {
 
     // Use concat demuxer with re-encoding (not -c copy) for reliability
     await new Promise((resolve, reject) => {
+      let ffmpegStderr = [];
+
       ffmpeg()
         .input(concatListPath)
         .inputOptions(['-f', 'concat', '-safe', '0'])
@@ -427,13 +447,32 @@ class FFmpegRenderer {
         ])
         .output(tempConcatenated)
         .on('start', (commandLine) => {
-          console.log(`  ▶️  Concat ${numChunks} mini-segments (re-encode): ${commandLine.substring(0, 300)}...`);
+          console.log(`  ▶️  CONCAT COMMAND:`);
+          console.log(`  ${commandLine}`);
+        })
+        .on('stderr', (stderrLine) => {
+          // Capture all stderr for debugging
+          ffmpegStderr.push(stderrLine);
+          // Log important lines
+          if (stderrLine.includes('error') || stderrLine.includes('Error') ||
+              stderrLine.includes('failed') || stderrLine.includes('Invalid')) {
+            console.error(`  🔴 FFmpeg: ${stderrLine}`);
+          }
         })
         .on('end', () => {
           console.log(`  ✅ Concatenated ${numChunks} segments successfully`);
           resolve();
         })
-        .on('error', reject)
+        .on('error', (err, stdout, stderr) => {
+          console.error(`  ❌ CONCATENATION FAILED`);
+          console.error(`  Error message: ${err.message}`);
+          console.error(`  Exit code: ${err.code || 'unknown'}`);
+          if (stdout) console.error(`  STDOUT: ${stdout}`);
+          if (stderr) console.error(`  STDERR: ${stderr}`);
+          console.error(`  Last 10 FFmpeg stderr lines:`);
+          ffmpegStderr.slice(-10).forEach(line => console.error(`    ${line}`));
+          reject(err);
+        })
         .run();
     });
 
