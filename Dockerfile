@@ -6,6 +6,7 @@ FROM node:20-alpine3.17 AS base
 # Install FFmpeg and dependencies
 RUN apk add --no-cache \
     ffmpeg \
+    curl \
     python3 \
     make \
     g++ \
