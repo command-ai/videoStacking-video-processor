@@ -287,6 +287,7 @@ class FFmpegRenderer {
     await this.concatenateChunksWithTransitions({
       chunkPaths,
       chunkDurations,
+      chunks, // Pass chunk structure for accurate overlap calculation
       outputPath,
       voiceOver,
       backgroundMusic,
@@ -406,6 +407,7 @@ class FFmpegRenderer {
     const {
       chunkPaths,
       chunkDurations,
+      chunks,
       outputPath,
       voiceOver,
       backgroundMusic,
@@ -462,15 +464,11 @@ class FFmpegRenderer {
     // Each chunk overlaps by 1 image, so we apply xfade at the overlap point
     const filterParts = [];
 
-    // Calculate per-image duration from first chunk (3 images)
-    const CHUNK_SIZE = 3;
-    const perImageDuration = chunkDurations[0] / CHUNK_SIZE;
-    const overlapDuration = perImageDuration;
-
     // Track actual output duration as we build the xfade chain
     let outputDuration = chunkDurations[0];
 
-    console.log(`  📐 Overlap calculation: ${perImageDuration.toFixed(3)}s per image, ${overlapDuration.toFixed(3)}s overlap`);
+    console.log(`  📐 Starting concatenation: ${chunkPaths.length} chunks`);
+    console.log(`  📊 Chunk 0: ${chunks[0].images.length} images, ${chunkDurations[0].toFixed(3)}s → output: ${outputDuration.toFixed(3)}s`);
 
     // Build xfade chain: [0:v][1:v]xfade[v1]; [v1][2:v]xfade[v2]; etc.
     for (let i = 1; i < chunkPaths.length; i++) {
@@ -478,17 +476,24 @@ class FFmpegRenderer {
       const inputLabel2 = `[${i}:v]`;
       const outputLabel = `[v${i}]`;
 
+      // Calculate overlap duration from PREVIOUS chunk (chunk i-1)
+      // Overlap = duration of last image in previous chunk
+      const prevChunk = chunks[i - 1];
+      const overlapDuration = chunkDurations[i - 1] / prevChunk.images.length;
+
       // xfade offset should be at the overlapping image position
       // This is: end of current output - overlap duration - transition duration
       const offset = outputDuration - overlapDuration - transitionDuration;
 
-      console.log(`  🔗 Chunk ${i-1}→${i}: offset=${offset.toFixed(3)}s (output so far: ${outputDuration.toFixed(3)}s)`);
+      console.log(`  🔗 Chunk ${i-1}→${i}: ${prevChunk.images.length} images, overlap=${overlapDuration.toFixed(3)}s, offset=${offset.toFixed(3)}s`);
 
       filterParts.push(`${inputLabel1}${inputLabel2}xfade=transition=fade:duration=${transitionDuration}:offset=${offset}${outputLabel}`);
 
       // Update output duration for next iteration
       // xfade output = previous output + new chunk - transition duration
       outputDuration = outputDuration + chunkDurations[i] - transitionDuration;
+
+      console.log(`  📊 Chunk ${i}: ${chunks[i].images.length} images, ${chunkDurations[i].toFixed(3)}s → cumulative output: ${outputDuration.toFixed(3)}s`);
     }
 
     const filterComplex = filterParts.join(';');
