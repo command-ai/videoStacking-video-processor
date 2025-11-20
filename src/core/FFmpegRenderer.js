@@ -458,7 +458,9 @@ class FFmpegRenderer {
       }
     }
 
-    const tempConcatenated = path.join(tempDir, 'concatenated.mp4');
+    // Use unique temp filename based on output file to prevent collisions between concurrent requests
+    const outputBasename = path.basename(outputPath, path.extname(outputPath));
+    const tempConcatenated = path.join(tempDir, `concatenated_${outputBasename}.mp4`);
 
     // Build xfade filter chain for seamless transitions between chunks
     // Each chunk overlaps by 1 image, so we apply xfade at the overlap point
