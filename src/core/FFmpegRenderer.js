@@ -460,7 +460,7 @@ class FFmpegRenderer {
           }
         })
         .on('end', () => {
-          console.log(`  ✅ Concatenated ${numChunks} segments successfully`);
+          console.log(`  ✅ Concatenated ${chunkPaths.length} segments successfully`);
           resolve();
         })
         .on('error', (err, stdout, stderr) => {
