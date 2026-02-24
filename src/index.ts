@@ -8,11 +8,18 @@ import { z } from 'zod'
 const app = express()
 app.use(express.json())
 
+// ── Concurrency gate ─────────────────────────────────────────────────────────
+const MAX_CONCURRENT = config.MAX_CONCURRENT_JOBS || 2
+let activeJobs = 0
+
 // Health check endpoint
 app.get('/health', (_req, res) => {
-  res.json({ 
+  res.json({
     status: 'healthy',
     service: 'video-processor',
+    activeJobs,
+    maxConcurrent: MAX_CONCURRENT,
+    availableSlots: MAX_CONCURRENT - activeJobs,
     timestamp: new Date().toISOString()
   })
 })
@@ -49,8 +56,16 @@ const enhanceSchema = z.object({
 app.post('/enhance', async (req, res) => {
   try {
     const data = enhanceSchema.parse(req.body)
-    
-    logger.info(`Received enhancement job for video: ${data.videoId}`)
+
+    // Reject if at capacity so LB routes to another replica
+    if (activeJobs >= MAX_CONCURRENT) {
+      logger.warn(`At capacity (${activeJobs}/${MAX_CONCURRENT}), rejecting enhance`, { videoId: data.videoId })
+      res.status(503).json({ error: 'at_capacity', activeJobs, maxConcurrent: MAX_CONCURRENT })
+      return
+    }
+
+    activeJobs++
+    logger.info(`Received enhancement job (${activeJobs}/${MAX_CONCURRENT}): ${data.videoId}`)
     logger.info('Enhancement request details:', {
       videoId: data.videoId,
       platform: data.platform,
@@ -59,22 +74,27 @@ app.post('/enhance', async (req, res) => {
       hasVoiceover: !!data.enhancements?.voiceover,
       voiceoverData: data.enhancements?.voiceover
     })
-    
+
     // Set a longer timeout for the response (5 minutes)
     res.setTimeout(5 * 60 * 1000, () => {
       logger.error('Enhancement request timed out after 5 minutes', { videoId: data.videoId })
       res.status(504).json({ error: 'Request timeout - processing taking too long' })
     })
-    
-    // Import the enhanced processor
-    const { processEnhancedVideo } = await import('./processors/enhanced-processor.js')
-    
-    // Process immediately and return result
-    const result = await processEnhancedVideo(data)
-    
-    logger.info('Enhancement completed successfully', { videoId: data.videoId, result })
-    res.json(result)
-    
+
+    try {
+      // Import the enhanced processor
+      const { processEnhancedVideo } = await import('./processors/enhanced-processor.js')
+
+      // Process immediately and return result
+      const result = await processEnhancedVideo(data)
+
+      logger.info('Enhancement completed successfully', { videoId: data.videoId, result })
+      res.json(result)
+    } finally {
+      activeJobs--
+      logger.info(`Enhancement finished (${activeJobs}/${MAX_CONCURRENT})`, { videoId: data.videoId })
+    }
+
   } catch (error) {
     logger.error('Enhancement processing failed:', {
       error: error instanceof Error ? {
@@ -92,20 +112,28 @@ app.post('/enhance', async (req, res) => {
 app.post('/process', async (req, res) => {
   try {
     const data = processSchema.parse(req.body)
-    
-    logger.info(`Received video processing job: ${data.videoId}`, {
+
+    // Reject if at capacity so LB routes to another replica
+    if (activeJobs >= MAX_CONCURRENT) {
+      logger.warn(`At capacity (${activeJobs}/${MAX_CONCURRENT}), rejecting process`, { videoId: data.videoId })
+      res.status(503).json({ error: 'at_capacity', activeJobs, maxConcurrent: MAX_CONCURRENT })
+      return
+    }
+
+    activeJobs++
+    logger.info(`Received video processing job (${activeJobs}/${MAX_CONCURRENT}): ${data.videoId}`, {
       platform: data.platform,
       targetDuration: data.targetDuration,
       layoutMode: data.settings?.layoutMode
     })
-    
+
     // Acknowledge quickly to prevent timeout
-    res.json({ 
-      received: true, 
+    res.json({
+      received: true,
       videoId: data.videoId,
-      message: 'Video processing started' 
+      message: 'Video processing started'
     })
-    
+
     // Process video in background with additional context (fire and forget)
     processVideo(data.videoId, {
       platform: data.platform,
@@ -113,17 +141,32 @@ app.post('/process', async (req, res) => {
       targetDuration: data.targetDuration
     }).catch(error => {
       logger.error('Video processing failed:', error)
+    }).finally(() => {
+      activeJobs--
+      logger.info(`Video processing finished (${activeJobs}/${MAX_CONCURRENT})`, { videoId: data.videoId })
     })
-    
+
   } catch (error) {
     logger.error('Invalid request:', error)
     res.status(400).json({ error: 'Invalid request' })
   }
 })
 
-// Graceful shutdown
+// Graceful shutdown — wait for active FFmpeg jobs before exiting
 process.on('SIGTERM', async () => {
-  logger.info('SIGTERM received, shutting down gracefully...')
+  logger.info('SIGTERM received, waiting for active jobs to complete...', { activeJobs })
+
+  // Wait up to 5 min for active jobs to finish
+  const deadline = Date.now() + 5 * 60 * 1000
+  while (activeJobs > 0 && Date.now() < deadline) {
+    logger.info(`Waiting for ${activeJobs} active jobs to finish...`)
+    await new Promise(r => setTimeout(r, 2000))
+  }
+
+  if (activeJobs > 0) {
+    logger.warn(`Shutting down with ${activeJobs} jobs still active (deadline exceeded)`)
+  }
+
   await prisma.$disconnect()
   process.exit(0)
 })
