@@ -10,6 +10,8 @@ interface VideoProcessingOptions {
   onProgress?: (progress: { percent: number; stage: string }) => void
   adaptiveGraphics?: boolean
   keepTemp?: boolean
+  preset?: string
+  quality?: number
 }
 
 interface VideoContext {
@@ -106,7 +108,8 @@ export async function processVideo(videoId: string, context?: VideoContext) {
     logger.info(`Generating video with settings:`, {
       platform: context?.platform || video.platform,
       targetDuration: combinedSettings.targetDuration,
-      layoutMode: combinedSettings.layoutMode
+      layoutMode: combinedSettings.layoutMode,
+      preset: combinedSettings.preset || 'fast'
     })
     
     const outputPath = await generator.generateVideo(
@@ -115,6 +118,8 @@ export async function processVideo(videoId: string, context?: VideoContext) {
       {
         settings: combinedSettings,
         imageMode: combinedSettings.layoutMode || 'letterbox', // Map layoutMode to imageMode
+        preset: combinedSettings.preset || 'fast', // Dynamic: ultrafast|veryfast|fast|medium
+        quality: combinedSettings.crf || 23,
         adaptiveGraphics: true,
         onProgress: (progress) => {
           logger.info(`Video ${videoId} progress: ${progress.percent}%`)

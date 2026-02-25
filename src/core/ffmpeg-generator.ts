@@ -14,6 +14,7 @@ interface VideoConfig {
   bitrate: string
   audioCodec: string
   videoCodec: string
+  preset?: 'ultrafast' | 'veryfast' | 'fast' | 'medium'
 }
 
 interface GenerateVideoOptions {
@@ -41,7 +42,7 @@ export async function generateVideo(options: GenerateVideoOptions): Promise<void
     command
       .outputOptions([
         '-c:v', config.videoCodec || 'libx264',
-        '-preset', 'fast',
+        '-preset', config.preset || 'fast',
         '-crf', '23',
         '-c:a', config.audioCodec || 'aac',
         '-b:a', '128k',

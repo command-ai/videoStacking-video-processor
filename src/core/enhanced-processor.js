@@ -36,6 +36,9 @@ export class EnhancedVideoProcessor {
       onProgress
     } = params
 
+    // Store preset override for all FFmpeg commands in this session
+    this.presetOverride = settings?.preset || null
+
     const sessionId = `${videoId}_${Date.now()}`
     const workDir = path.join(this.tempDir, sessionId)
     await fs.mkdir(workDir, { recursive: true })
@@ -470,7 +473,7 @@ export class EnhancedVideoProcessor {
       '-filter_complex', `"${filterComplex}"`,
       '-c:a', 'copy',
       '-c:v', 'libx264',
-      '-preset', 'fast',
+      '-preset', this.presetOverride || 'fast',
       '-crf', '23',
       outputPath
     ].join(' ')
@@ -572,7 +575,7 @@ export class EnhancedVideoProcessor {
       '-f', 'lavfi',
       '-i', `"${filterComplex}"`,
       '-c:v', 'libx264',
-      '-preset', 'fast',
+      '-preset', this.presetOverride || 'fast',
       '-crf', '23',
       '-t', duration,
       introPath
@@ -637,7 +640,7 @@ export class EnhancedVideoProcessor {
       '-f', 'lavfi',
       '-i', `"${filterComplex}"`,
       '-c:v', 'libx264',
-      '-preset', 'fast',
+      '-preset', this.presetOverride || 'fast',
       '-crf', '23',
       '-t', duration,
       outroPath
@@ -1079,7 +1082,12 @@ export class EnhancedVideoProcessor {
       // Add more platforms as needed
     }
     
-    return settings[platform] || settings.youtube
+    const platformConfig = settings[platform] || settings.youtube
+    // Allow preset override from job settings (tier-based quality control)
+    if (this.presetOverride) {
+      platformConfig.preset = this.presetOverride
+    }
+    return platformConfig
   }
 }
 
