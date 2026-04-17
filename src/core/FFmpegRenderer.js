@@ -85,6 +85,10 @@ class FFmpegRenderer {
 
   /**
    * Build FFmpeg command - MEMORY-EFFICIENT TWO-PASS for many images
+   *
+   * Item 4 & 5 support: options.perFrameFilters (array of {brightness,
+   * contrast, saturation, blur} or null, aligned to images) and
+   * options.perFrameDurations (array of seconds, aligned to images).
    */
   async buildCommand(options) {
     const {
@@ -102,7 +106,9 @@ class FFmpegRenderer {
       preset = 'medium',
       quality = 23,
       imageMode = this.defaultImageMode,
-      transition = { type: 'fade', duration: 0.5 } // Default fade transition
+      transition = { type: 'fade', duration: 0.5 }, // Default fade transition
+      perFrameFilters = null,
+      perFrameDurations = null
     } = options;
 
     // Adjust transition duration based on image count to reduce memory usage
@@ -170,7 +176,9 @@ class FFmpegRenderer {
       logoIndex,
       reviewIndex,
       imageMode,
-      transition: adjustedTransition // Use adjusted transition duration
+      transition: adjustedTransition, // Use adjusted transition duration
+      perFrameFilters,
+      perFrameDurations
     });
 
     // Apply filter and output options
@@ -196,6 +204,11 @@ class FFmpegRenderer {
    * Build command using CHUNKED RENDERING for unlimited images with transitions
    * Splits images into chunks of 10, renders each with transitions, then concatenates
    * Maintains quality, transitions, and music looping while staying within memory limits
+   *
+   * Items 4 & 5 support: perFrameFilters and perFrameDurations are sliced
+   * per-chunk and forwarded to renderChunk. Each chunk's local duration is
+   * computed from its slice of perFrameDurations when provided, otherwise
+   * falls back to a proportional share of the global duration.
    */
   async buildCommandChunked(options) {
     const {
@@ -213,7 +226,9 @@ class FFmpegRenderer {
       preset = 'medium',
       quality = 23,
       imageMode = this.defaultImageMode,
-      transition = { type: 'fade', duration: 0.5 }
+      transition = { type: 'fade', duration: 0.5 },
+      perFrameFilters = null,
+      perFrameDurations = null
     } = options;
 
     // CRITICAL: xfade has runaway memory with many images in one filter graph
@@ -222,19 +237,24 @@ class FFmpegRenderer {
     const CHUNK_SIZE = 3; // Small batches to keep xfade filter graph manageable
     const OVERLAP = 1; // Overlap last image of chunk N with first image of chunk N+1 for seamless transitions
     const tempDir = path.dirname(outputPath);
+    const outputBasename = path.basename(outputPath, '.mp4');
     const chunkPaths = [];
     const chunkDurations = [];
 
-    // Calculate chunks with overlap
+    // Calculate chunks with overlap. `originalIndices` tracks which original
+    // image each chunk slot points to — used to slice perFrameFilters and
+    // perFrameDurations for the chunk's local render pass.
     const chunks = [];
     let idx = 0;
     while (idx < images.length) {
       const chunkImages = [];
+      const originalIndices = [];
       const isFirstChunk = chunks.length === 0;
 
       // For non-first chunks, include overlap image from previous chunk
       if (!isFirstChunk && idx > 0) {
         chunkImages.push(images[idx - OVERLAP]);
+        originalIndices.push(idx - OVERLAP);
       }
 
       // Add CHUNK_SIZE images (or remaining images)
@@ -242,10 +262,12 @@ class FFmpegRenderer {
       const count = Math.min(CHUNK_SIZE, remaining);
       for (let i = 0; i < count; i++) {
         chunkImages.push(images[idx + i]);
+        originalIndices.push(idx + i);
       }
 
       chunks.push({
         images: chunkImages,
+        originalIndices,
         startIdx: idx,
         hasOverlap: !isFirstChunk
       });
@@ -260,11 +282,35 @@ class FFmpegRenderer {
     for (let chunkIndex = 0; chunkIndex < numChunks; chunkIndex++) {
       const chunk = chunks[chunkIndex];
       const chunkImages = chunk.images;
-      const chunkDuration = (duration * chunkImages.length) / images.length;
 
-      console.log(`  🎬 Rendering chunk ${chunkIndex + 1}/${numChunks} (${chunkImages.length} images${chunk.hasOverlap ? ', 1 overlap' : ''})`);
+      // Slice per-frame data for this chunk's original indices.
+      let chunkPerFrameFilters = null;
+      let chunkPerFrameDurations = null;
+      if (Array.isArray(perFrameFilters)) {
+        chunkPerFrameFilters = chunk.originalIndices.map((i) => perFrameFilters[i] || null);
+      }
+      if (Array.isArray(perFrameDurations)) {
+        chunkPerFrameDurations = chunk.originalIndices.map((i) =>
+          typeof perFrameDurations[i] === 'number' && perFrameDurations[i] > 0
+            ? perFrameDurations[i]
+            : null
+        );
+      }
 
-      const chunkPath = path.join(tempDir, `chunk_${chunkIndex}.mp4`);
+      // Prefer explicit per-frame duration sum for this chunk; fall back to
+      // proportional share of total. The overlap image is shared with the
+      // previous chunk — its on-screen time has already been paid for there,
+      // but it's needed as a crossfade source here, so we still account for it.
+      let chunkDuration;
+      if (chunkPerFrameDurations && chunkPerFrameDurations.every((d) => d !== null)) {
+        chunkDuration = chunkPerFrameDurations.reduce((a, b) => a + b, 0);
+      } else {
+        chunkDuration = (duration * chunkImages.length) / images.length;
+      }
+
+      console.log(`  🎬 Rendering chunk ${chunkIndex + 1}/${numChunks} (${chunkImages.length} images${chunk.hasOverlap ? ', 1 overlap' : ''})${chunkPerFrameFilters ? ' with per-frame filters' : ''}`);
+
+      const chunkPath = path.join(tempDir, `chunk_${outputBasename}_${chunkIndex}.mp4`);
       chunkPaths.push(chunkPath);
       chunkDurations.push(chunkDuration);
 
@@ -278,7 +324,9 @@ class FFmpegRenderer {
         preset,
         quality,
         imageMode,
-        transition
+        transition,
+        perFrameFilters: chunkPerFrameFilters,
+        perFrameDurations: chunkPerFrameDurations
       });
     }
 
@@ -288,6 +336,7 @@ class FFmpegRenderer {
       chunkPaths,
       chunkDurations,
       chunks, // Pass chunk structure for accurate overlap calculation
+      totalImageCount: images.length, // Total unique images for per-image duration calculation
       outputPath,
       voiceOver,
       backgroundMusic,
@@ -331,7 +380,9 @@ class FFmpegRenderer {
       preset,
       quality,
       imageMode,
-      transition
+      transition,
+      perFrameFilters = null,
+      perFrameDurations = null
     } = options;
 
     const command = ffmpeg();
@@ -346,7 +397,9 @@ class FFmpegRenderer {
       duration,
       imageMode,
       transition,
-      fps: 30
+      fps: 30,
+      perFrameFilters,
+      perFrameDurations
     });
 
     command.complexFilter(filters);
@@ -408,6 +461,7 @@ class FFmpegRenderer {
       chunkPaths,
       chunkDurations,
       chunks,
+      totalImageCount,
       outputPath,
       voiceOver,
       backgroundMusic,
@@ -424,7 +478,10 @@ class FFmpegRenderer {
     } = options;
 
     const tempDir = path.dirname(outputPath);
-    const transitionDuration = transition?.duration || 0.5;
+    // Clamp transition duration to at most half of perImageDuration to prevent overlap issues
+    const rawTransitionDuration = transition?.duration || 0.5;
+    const perImageDur = duration / totalImageCount;
+    const transitionDuration = Math.min(rawTransitionDuration, perImageDur * 0.5);
 
     // If only one chunk, just add audio/overlays and return
     if (chunkPaths.length === 1) {
@@ -467,10 +524,13 @@ class FFmpegRenderer {
     const filterParts = [];
 
     // Track actual output duration as we build the xfade chain
-    let outputDuration = chunkDurations[0];
+    // xfade output formula: output_duration = offset + second_input_duration
+    // The overlap image appears in both adjacent chunks, so we overlap by one image's duration
+    const perImageDuration = duration / totalImageCount;
+    let actualOutputDuration = chunkDurations[0];
 
-    console.log(`  📐 Starting concatenation: ${chunkPaths.length} chunks`);
-    console.log(`  📊 Chunk 0: ${chunks[0].images.length} images, ${chunkDurations[0].toFixed(3)}s → output: ${outputDuration.toFixed(3)}s`);
+    console.log(`  📐 Starting concatenation: ${chunkPaths.length} chunks, perImageDuration=${perImageDuration.toFixed(3)}s`);
+    console.log(`  📊 Chunk 0: ${chunks[0].images.length} images, ${chunkDurations[0].toFixed(3)}s → output: ${actualOutputDuration.toFixed(3)}s`);
 
     // Build xfade chain: [0:v][1:v]xfade[v1]; [v1][2:v]xfade[v2]; etc.
     for (let i = 1; i < chunkPaths.length; i++) {
@@ -478,24 +538,23 @@ class FFmpegRenderer {
       const inputLabel2 = `[${i}:v]`;
       const outputLabel = `[v${i}]`;
 
-      // Calculate overlap duration from PREVIOUS chunk (chunk i-1)
-      // Overlap = duration of last image in previous chunk
-      const prevChunk = chunks[i - 1];
-      const overlapDuration = chunkDurations[i - 1] / prevChunk.images.length;
+      // The overlap image (shared between chunk i-1 and chunk i) has duration = perImageDuration
+      // We set xfade offset so the crossfade covers exactly the overlap image's time
+      // offset = point in the current output where the overlap image starts
+      // The overlap image is the LAST image in the current output, so:
+      //   offset = actualOutputDuration - perImageDuration
+      // transitionDuration controls only the visual crossfade length (must be <= perImageDuration)
+      const overlapDuration = perImageDuration;
+      const offset = Math.max(0, actualOutputDuration - overlapDuration);
 
-      // xfade offset should be at the overlapping image position
-      // This is: end of current output - overlap duration - transition duration
-      const offset = outputDuration - overlapDuration - transitionDuration;
-
-      console.log(`  🔗 Chunk ${i-1}→${i}: ${prevChunk.images.length} images, overlap=${overlapDuration.toFixed(3)}s, offset=${offset.toFixed(3)}s`);
+      console.log(`  🔗 Chunk ${i-1}→${i}: overlap=${overlapDuration.toFixed(3)}s, offset=${offset.toFixed(3)}s, xfade=${transitionDuration}s`);
 
       filterParts.push(`${inputLabel1}${inputLabel2}xfade=transition=fade:duration=${transitionDuration}:offset=${offset}${outputLabel}`);
 
-      // Update output duration for next iteration
-      // xfade output = previous output + new chunk - transition duration
-      outputDuration = outputDuration + chunkDurations[i] - transitionDuration;
+      // xfade output duration = offset + duration_of_second_input
+      actualOutputDuration = offset + chunkDurations[i];
 
-      console.log(`  📊 Chunk ${i}: ${chunks[i].images.length} images, ${chunkDurations[i].toFixed(3)}s → cumulative output: ${outputDuration.toFixed(3)}s`);
+      console.log(`  📊 Chunk ${i}: ${chunks[i].images.length} images, ${chunkDurations[i].toFixed(3)}s → cumulative output: ${actualOutputDuration.toFixed(3)}s`);
     }
 
     const filterComplex = filterParts.join(';');
@@ -715,12 +774,13 @@ class FFmpegRenderer {
 
     const segmentDuration = duration / images.length;
     const tempDir = path.dirname(outputPath);
+    const segmentBasename = path.basename(outputPath, '.mp4');
     const segments = [];
 
     // Pass 1: Create video segment for each image
     for (let i = 0; i < images.length; i++) {
       const img = images[i];
-      const segmentPath = path.join(tempDir, `segment_${i}.mp4`);
+      const segmentPath = path.join(tempDir, `segment_${segmentBasename}_${i}.mp4`);
       segments.push(segmentPath);
 
       // Get image dimensions for proper mode selection
@@ -768,7 +828,7 @@ class FFmpegRenderer {
     }
 
     // Pass 2: Concatenate segments with audio/overlays
-    const concatListPath = path.join(tempDir, 'concat_list.txt');
+    const concatListPath = path.join(tempDir, `concat_list_${segmentBasename}.txt`);
     await fs.writeFile(concatListPath, segments.map(s => `file '${s}'`).join('\n'));
 
     const command = ffmpeg()
@@ -858,6 +918,12 @@ class FFmpegRenderer {
 
   /**
    * Build filter complex - WORKING IMPLEMENTATION WITH TRANSITIONS
+   *
+   * Per-frame FFmpeg filters (Item 4) are appended to each image's
+   * processed-stage output as `eq=brightness=..:contrast=..:saturation=..`
+   * plus an optional `boxblur=...`. Per-frame durations (Item 5) replace
+   * the uniform split; when set, xfade offsets are computed cumulatively
+   * from the per-frame values.
    */
   async buildFilterComplex(options) {
     const {
@@ -872,7 +938,9 @@ class FFmpegRenderer {
       logoIndex,
       reviewIndex,
       imageMode = this.defaultImageMode,
-      transition = { type: 'fade', duration: 0.5 } // Default fade transition
+      transition = { type: 'fade', duration: 0.5 }, // Default fade transition
+      perFrameFilters = null,
+      perFrameDurations = null
     } = options;
 
     const filters = [];
@@ -882,27 +950,59 @@ class FFmpegRenderer {
     const numSegments = images.length;
 
     // CRITICAL: Account for xfade transition overlap
-    // Each xfade transition overlaps by transition.duration, reducing total output
-    // To hit target duration, we must compensate: adjustedDuration = target + (transitions × duration)
     const transitionDuration = transition.duration || 0.5;
     const transitionCount = Math.max(0, numSegments - 1);
     const totalTransitionTime = transitionCount * transitionDuration;
     const adjustedDuration = duration + totalTransitionTime;
-    const actualImageDuration = adjustedDuration / numSegments;
+    const uniformImageDuration = adjustedDuration / numSegments;
+
+    // Resolve per-image on-screen durations. When perFrameDurations is
+    // provided, individual values take precedence; otherwise every image
+    // gets the uniform split. The xfade chain consumes these directly.
+    const usePerFrame = Array.isArray(perFrameDurations) && perFrameDurations.length === numSegments;
+    const imageDurations = usePerFrame
+      ? perFrameDurations.map((d) => (typeof d === 'number' && d > 0 ? d : uniformImageDuration))
+      : new Array(numSegments).fill(uniformImageDuration);
 
     console.log(`  ⏱️  Duration compensation: ${numSegments} images, ${transitionCount} transitions × ${transitionDuration}s = ${totalTransitionTime}s overlap`);
-    console.log(`  📊 Adjusted: ${duration}s target + ${totalTransitionTime}s = ${adjustedDuration}s total → ${actualImageDuration.toFixed(3)}s per image`);
+    console.log(`  📊 Adjusted: ${duration}s target + ${totalTransitionTime}s = ${adjustedDuration}s total${usePerFrame ? ' — per-frame durations in use' : ` → ${uniformImageDuration.toFixed(3)}s per image`}`);
+    if (usePerFrame) {
+      console.log(`  📊 Per-frame durations: [${imageDurations.map((d) => d.toFixed(2)).join(', ')}]`);
+    }
     
     // Use images directly (1:1 mapping, no cycling)
     const imageSequence = images;
     const uniqueImages = images;
     const imageMap = {};
-    
+
+    // Item 4 helper — build the per-image FFmpeg filter snippet from the
+    // sanitised filter object. Returns '' if no filter is set.
+    const buildFrameFilterChain = (f) => {
+      if (!f || typeof f !== 'object') return '';
+      const eqParts = [];
+      if (typeof f.brightness === 'number' && f.brightness !== 0) {
+        eqParts.push(`brightness=${f.brightness.toFixed(3)}`);
+      }
+      if (typeof f.contrast === 'number' && f.contrast !== 1) {
+        eqParts.push(`contrast=${f.contrast.toFixed(3)}`);
+      }
+      if (typeof f.saturation === 'number' && f.saturation !== 1) {
+        eqParts.push(`saturation=${f.saturation.toFixed(3)}`);
+      }
+      const parts = [];
+      if (eqParts.length > 0) parts.push(`eq=${eqParts.join(':')}`);
+      if (typeof f.blur === 'number' && f.blur > 0) {
+        // boxblur luma_radius[:luma_power][:chroma_radius[:chroma_power]]
+        parts.push(`boxblur=${Math.max(0, f.blur).toFixed(2)}:1`);
+      }
+      return parts.join(',');
+    };
+
     // Pre-process unique images ONCE (more efficient)
     for (const img of uniqueImages) {
       const inputIndex = images.indexOf(img);
       imageMap[img] = inputIndex;
-      
+
       // Get image dimensions for smart mode selection
       let imageDims = null;
       try {
@@ -910,8 +1010,15 @@ class FFmpegRenderer {
       } catch (err) {
         console.warn(`Warning: Could not get dimensions for ${img}, using crop fill mode`);
       }
-      
-      // Build filter based on selected mode
+
+      // Build mode filter — we land on an intermediate label that becomes
+      // either `[processed${i}]` or `[pre_processed${i}]` (if we need to
+      // append per-frame filters on top).
+      const frameFilterChain = Array.isArray(perFrameFilters) && perFrameFilters[inputIndex]
+        ? buildFrameFilterChain(perFrameFilters[inputIndex])
+        : '';
+      const intermediateLabel = frameFilterChain ? `pre_processed${inputIndex}` : `processed${inputIndex}`;
+
       let filter;
       if (imageMode === this.IMAGE_MODES.LETTERBOX && imageDims) {
         filter = this.imageHandlingModes.buildLetterboxFilter({
@@ -922,7 +1029,7 @@ class FFmpegRenderer {
           imageHeight: imageDims.height,
           backgroundColor: '#2a2a2a'
         });
-        filters.push(filter.replace('[letterboxed]', `[processed${inputIndex}]`));
+        filters.push(filter.replace('[letterboxed]', `[${intermediateLabel}]`));
       } else if (imageMode === this.IMAGE_MODES.BLUR_BACKGROUND) {
         filter = this.imageHandlingModes.buildBlurBackgroundFilter({
           inputIndex,
@@ -930,7 +1037,7 @@ class FFmpegRenderer {
           videoHeight,
           blurStrength: 30
         });
-        filters.push(filter.replace('[composed]', `[processed${inputIndex}]`));
+        filters.push(filter.replace('[composed]', `[${intermediateLabel}]`));
       } else {
         // Default to crop fill mode (no scaling needed)
         filter = this.imageHandlingModes.buildCropFillFilter({
@@ -939,27 +1046,42 @@ class FFmpegRenderer {
           videoHeight,
           scale: 1 // Use native resolution
         });
-        filters.push(filter + `[processed${inputIndex}]`);
+        filters.push(filter + `[${intermediateLabel}]`);
+      }
+
+      // Item 4 — append the FFmpeg-native filter chain on the processed
+      // frame. Effect-stacking order: mode filter (scale/crop) first, then
+      // eq/boxblur. This matches the preview order (CSS filters are applied
+      // on the already-rendered bitmap) and keeps blur from being obscured
+      // by later scaling.
+      if (frameFilterChain) {
+        filters.push(`[${intermediateLabel}]${frameFilterChain}[processed${inputIndex}]`);
       }
     }
     
-    // Create Ken Burns effect for each image in sequence
+    // Create per-image segments. Uses per-frame durations when provided.
+    // NOTE: With per-frame durations we also need to pad each image by the
+    // outgoing xfade.duration so the crossfade has source material to work
+    // with — that's why uniformImageDuration already adds transition
+    // overlap above. For per-frame durations we do the same pad per image.
     let imageInputs = [];
     imageSequence.forEach((img, idx) => {
       const sourceIdx = imageMap[img];
       const outputLabel = `v${idx}`;
-      const framesForSegment = Math.ceil(actualImageDuration * fps);
-      
+      const onScreenDur = imageDurations[idx];
+      // Pad outgoing by transitionDuration so the xfade has overlap. The
+      // last image doesn't need a trailing overlap (no following xfade).
+      const renderedDur = idx < numSegments - 1 ? onScreenDur + transitionDuration : onScreenDur;
+      const framesForSegment = Math.ceil(renderedDur * fps);
+
       // Disable Ken Burns zoom for all modes - use static transitions
       const needsKenBurns = false;
-      
+
       if (needsKenBurns) {
-        const zoomAmount = 0.3; // From original config
-        // Ken Burns zoom effect using processed image
+        const zoomAmount = 0.3;
         filters.push(`[processed${sourceIdx}]zoompan=z='1+(on/${framesForSegment}*${zoomAmount})':x='(iw-ow)/2':y='(ih-oh)/2':d=${framesForSegment}:s=${videoWidth}x${videoHeight}:fps=${fps}[${outputLabel}]`);
       } else {
-        // FIXED: For letterbox/blur modes, use proper frame generation
-        filters.push(`[processed${sourceIdx}]loop=loop=${framesForSegment}:size=1:start=0,fps=${fps},trim=duration=${actualImageDuration}[${outputLabel}]`);
+        filters.push(`[processed${sourceIdx}]loop=loop=${framesForSegment}:size=1:start=0,fps=${fps},trim=duration=${renderedDur.toFixed(3)}[${outputLabel}]`);
       }
       imageInputs.push(`[${outputLabel}]`);
     });
@@ -970,22 +1092,28 @@ class FFmpegRenderer {
       const inputLabel = imageInputs[0].replace(/[\[\]]/g, '');
       filters.push(`[${inputLabel}]null[base_video]`);
     } else {
-      // Multiple images - build xfade chain for smooth transitions
+      // Multiple images - build xfade chain for smooth transitions.
+      // Offsets are cumulative based on per-image on-screen durations: each
+      // xfade kicks in once the current output timeline has advanced by
+      // (previous offset) + (current image on-screen duration) - xfade dur.
+      // Equivalent to summing on-screen durations minus transition durations.
       const transitionType = transition.type || 'fade';
-      const transitionDuration = transition.duration || 0.5;
 
       let currentLabel = imageInputs[0].replace(/[\[\]]/g, '');
+      let cumulativeOffset = 0;
 
       for (let i = 1; i < imageInputs.length; i++) {
         const nextLabel = imageInputs[i].replace(/[\[\]]/g, '');
         const outputLabel = i === imageInputs.length - 1 ? 'base_video' : `xfade${i}`;
 
-        // Calculate transition offset
-        // offset = start_of_current_clip + duration_of_clip - transition_duration
-        const offset = (i * actualImageDuration) - transitionDuration;
+        // The i-th xfade begins once the output has played the first i
+        // images minus (i-1) prior overlaps minus one current overlap.
+        // With per-image durations, offset advances by imageDurations[i-1].
+        cumulativeOffset += imageDurations[i - 1] - transitionDuration;
+        const offset = Math.max(0, cumulativeOffset);
 
         filters.push(
-          `[${currentLabel}][${nextLabel}]xfade=transition=${transitionType}:duration=${transitionDuration}:offset=${offset}[${outputLabel}]`
+          `[${currentLabel}][${nextLabel}]xfade=transition=${transitionType}:duration=${transitionDuration}:offset=${offset.toFixed(3)}[${outputLabel}]`
         );
 
         currentLabel = outputLabel;

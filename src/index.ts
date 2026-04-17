@@ -24,12 +24,36 @@ app.get('/health', (_req, res) => {
   })
 })
 
-// Process video job endpoint
+// Per-frame FFmpeg filter parameters (Item 4 of VIDEO_STUDIO_TODO).
+const ffmpegFrameFiltersSchema = z.object({
+  brightness: z.number().min(-1).max(1).optional(),
+  contrast:   z.number().min(0).max(2).optional(),
+  saturation: z.number().min(0).max(3).optional(),
+  blur:       z.number().min(0).max(10).optional()
+}).strict()
+
+// Per-frame override. Either `mediaId` keys the entry to a specific
+// VideoMedia id or the entry is positional (aligned to the video's
+// mediaIds array by index).
+const frameOverrideSchema = z.object({
+  mediaId: z.string().optional(),
+  duration: z.number().positive().max(600).optional(),
+  ffmpegFilters: ffmpegFrameFiltersSchema.optional()
+}).passthrough()
+
+// Process video job endpoint. settings carries the bulk of the payload —
+// `.passthrough()` retains all the existing fields (layoutMode, preset,
+// captions, music, etc.) so older payloads keep working unchanged. Items
+// 4/5/6 from VIDEO_STUDIO_TODO surface through settings.frames[] and
+// settings.targetDurationOverride.
 const processSchema = z.object({
   videoId: z.string().cuid(),
   jobId: z.union([z.string(), z.number()]).optional(),
   platform: z.string().optional(),
-  settings: z.any().optional(),
+  settings: z.object({
+    targetDurationOverride: z.number().positive().max(600).optional(),
+    frames: z.array(frameOverrideSchema).optional()
+  }).passthrough().optional(),
   mediaIds: z.array(z.string()).optional(),
   projectId: z.string().optional(),
   organizationId: z.string().optional(),

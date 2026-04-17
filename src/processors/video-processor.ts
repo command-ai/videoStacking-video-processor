@@ -6,12 +6,26 @@ import path from 'path'
 import fs from 'fs/promises'
 import { execSync } from 'child_process'
 
+interface FrameOverride {
+  duration?: number
+  ffmpegFilters?: {
+    brightness?: number
+    contrast?: number
+    saturation?: number
+    blur?: number
+  }
+}
+
 interface VideoProcessingOptions {
   onProgress?: (progress: { percent: number; stage: string }) => void
   adaptiveGraphics?: boolean
   keepTemp?: boolean
   preset?: string
   quality?: number
+  /** Parallel to assets.images; one entry per image (or undefined). Item 4 & 5. */
+  imageFrameOverrides?: Array<FrameOverride | undefined>
+  /** Total duration override in seconds (Item 6). */
+  targetDurationOverride?: number
 }
 
 interface VideoContext {
@@ -77,7 +91,7 @@ export async function processVideo(videoId: string, context?: VideoContext) {
       })
     }
     
-    // 3. Prepare assets
+    // 3. Prepare assets (and map per-frame overrides onto local paths)
     const assets = await prepareAssets(media)
     
     // Note: If voice-over audio is generated in the future, add it to assets as:
@@ -104,14 +118,54 @@ export async function processVideo(videoId: string, context?: VideoContext) {
       targetDuration: context?.targetDuration || video.targetDuration,
       layoutMode: context?.settings?.layoutMode || 'letterbox'  // Default to letterbox
     }
-    
+
+    // Item 6 — global duration override wins over the platform-derived value.
+    if (typeof combinedSettings.targetDurationOverride === 'number' && combinedSettings.targetDurationOverride > 0) {
+      combinedSettings.targetDuration = combinedSettings.targetDurationOverride
+    }
+
+    // Items 4 & 5 — normalize per-frame overrides into a mediaId-keyed map
+    // for O(1) lookup in the FFmpeg renderer. Positional entries (no
+    // mediaId) are aligned to the video's mediaIds array by index.
+    const rawFrames = Array.isArray(combinedSettings.frames) ? combinedSettings.frames : []
+    const frameOverridesByMediaId: Record<string, { duration?: number; ffmpegFilters?: Record<string, number> }> = {}
+    if (rawFrames.length > 0 && video.mediaIds && video.mediaIds.length > 0) {
+      for (let i = 0; i < rawFrames.length; i++) {
+        const entry = rawFrames[i] || {}
+        const mediaId: string | undefined = entry.mediaId || video.mediaIds[i]
+        if (!mediaId) continue
+        const override: { duration?: number; ffmpegFilters?: Record<string, number> } = {}
+        if (typeof entry.duration === 'number' && entry.duration > 0) {
+          override.duration = entry.duration
+        }
+        if (entry.ffmpegFilters && typeof entry.ffmpegFilters === 'object') {
+          override.ffmpegFilters = entry.ffmpegFilters
+        }
+        if (override.duration !== undefined || override.ffmpegFilters) {
+          frameOverridesByMediaId[mediaId] = override
+        }
+      }
+    }
+
     logger.info(`Generating video with settings:`, {
       platform: context?.platform || video.platform,
       targetDuration: combinedSettings.targetDuration,
+      targetDurationOverride: combinedSettings.targetDurationOverride,
       layoutMode: combinedSettings.layoutMode,
-      preset: combinedSettings.preset || 'fast'
+      preset: combinedSettings.preset || 'fast',
+      frameOverrideCount: Object.keys(frameOverridesByMediaId).length
     })
     
+    // Build a per-image overrides array aligned to assets.images — one
+    // slot per image (or undefined for no overrides). The renderer uses
+    // this to inject per-frame FFmpeg filter chains and duration values.
+    const imageFrameOverrides: Array<{ duration?: number; ffmpegFilters?: Record<string, number> } | undefined> = []
+    if (Array.isArray(assets.imageMediaIds) && Object.keys(frameOverridesByMediaId).length > 0) {
+      for (const mediaId of assets.imageMediaIds) {
+        imageFrameOverrides.push(frameOverridesByMediaId[mediaId] || undefined)
+      }
+    }
+
     const outputPath = await generator.generateVideo(
       context?.platform || video.platform,
       assets,
@@ -121,6 +175,12 @@ export async function processVideo(videoId: string, context?: VideoContext) {
         preset: combinedSettings.preset || 'fast', // Dynamic: ultrafast|veryfast|fast|medium
         quality: combinedSettings.crf || 23,
         adaptiveGraphics: true,
+        // Items 4 & 5 — per-frame overrides indexed parallel to assets.images.
+        imageFrameOverrides: imageFrameOverrides.length > 0 ? imageFrameOverrides : undefined,
+        // Item 6 — already folded into combinedSettings.targetDuration above,
+        // but also surfaced explicitly so the generator can distinguish a
+        // user-chosen total from a platform default if it ever needs to.
+        targetDurationOverride: combinedSettings.targetDurationOverride,
         onProgress: (progress) => {
           logger.info(`Video ${videoId} progress: ${progress.percent}%`)
           // Could update progress in database or send websocket update
@@ -203,7 +263,11 @@ async function prepareAssets(media: any[]): Promise<any> {
     logo: null,
     backgroundImage: null,
     backgroundVideo: null,
-    reviewImage: null
+    reviewImage: null,
+    // Parallel to `images` — each entry is the originating VideoMedia id.
+    // The video.ts core then applies per-frame overrides from
+    // options.settings.frameOverridesByMediaId using this map.
+    imageMediaIds: []
   }
   
   // Create temp directory for assets
@@ -259,8 +323,10 @@ async function prepareAssets(media: any[]): Promise<any> {
       } else if (item.metadata?.type === 'background') {
         assets.backgroundImage = tempPath
       } else {
-        // Regular project images
+        // Regular project images — remember the VideoMedia id alongside
+        // the local path so the renderer can apply per-frame overrides.
         assets.images.push(tempPath)
+        assets.imageMediaIds.push(item.id)
       }
     } else if (item.mimeType.startsWith('video/')) {
       assets.backgroundVideo = tempPath

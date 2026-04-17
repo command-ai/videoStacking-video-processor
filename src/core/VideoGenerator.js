@@ -83,35 +83,81 @@ class VideoGenerator {
     const { resolution, calculatedSizes } = template;
     const outputFilename = `${template.platform}_${Date.now()}.mp4`;
     const outputPath = path.join(this.outputDir, outputFilename);
-    
+
     // Ensure output directory exists
     await fs.mkdir(this.outputDir, { recursive: true });
-    
+
     // Calculate duration based on available images (1:1 mapping, no cycling)
     const imageCount = assets.images.length;
     let duration;
-    
-    // Check if targetDuration is provided in options.settings
-    if (options.settings && options.settings.targetDuration) {
-      duration = options.settings.targetDuration;
+
+    // Per-frame overrides (items 4 & 5). Array parallel to assets.images.
+    const perFrameOverrides = Array.isArray(options.imageFrameOverrides)
+      ? options.imageFrameOverrides
+      : [];
+    const perFrameDurations = perFrameOverrides.map((ov) =>
+      ov && typeof ov.duration === 'number' && ov.duration > 0 ? ov.duration : null
+    );
+    const hasPerFrameDurations = perFrameDurations.some((d) => d !== null);
+
+    // Item 6 — explicit global override wins.
+    const settings = options.settings || {};
+    if (typeof options.targetDurationOverride === 'number' && options.targetDurationOverride > 0) {
+      duration = options.targetDurationOverride;
+      console.log(`📊 Using global targetDurationOverride: ${duration}s (Item 6)`);
+    } else if (typeof settings.targetDuration === 'number' && settings.targetDuration > 0) {
+      duration = settings.targetDuration;
       console.log(`📊 Using platform-specific target duration: ${duration}s`);
     } else if (assets.voiceOver) {
       try {
         const audioDuration = await this.renderer.getAudioDuration(assets.voiceOver);
-        // Use voice duration + padding, but ensure minimum time per image
-        const minDurationForImages = imageCount * 3; // 3 seconds minimum per image
+        const minDurationForImages = imageCount * 3;
         duration = Math.max(audioDuration + 3, minDurationForImages);
       } catch (err) {
         console.warn('Could not determine audio duration, using image-based duration:', err.message);
-        duration = imageCount * 5; // 5 seconds per image fallback
+        duration = imageCount * 5;
       }
     } else {
-      // No voice over - use image-based duration
-      duration = imageCount * 5; // 5 seconds per image
+      duration = imageCount * 5;
     }
-    
-    console.log(`📊 Duration calculation: ${imageCount} images, ${duration}s total (${(duration/imageCount).toFixed(1)}s per image)`);
-    
+
+    // Per-frame duration precedence:
+    //   1. The user's explicit per-frame values are the ground truth for
+    //      individual frames.
+    //   2. The remaining budget (= `duration` minus the sum of explicit
+    //      per-frame durations) is split uniformly across the frames WITHOUT
+    //      an override.
+    //   3. If the sum of per-frame durations already exceeds `duration`, the
+    //      total duration expands to accommodate them (per-frame is ground
+    //      truth — matches the spec's Item 5 intent).
+    //   4. If there's no global override and all frames have explicit
+    //      durations, `duration` is replaced by their sum.
+    let resolvedPerFrameDurations = null;
+    if (hasPerFrameDurations) {
+      const overriddenTotal = perFrameDurations.reduce((sum, d) => sum + (d || 0), 0);
+      const overriddenCount = perFrameDurations.filter((d) => d !== null).length;
+      const remainingCount = imageCount - overriddenCount;
+      const remainingBudget = Math.max(0, duration - overriddenTotal);
+      const defaultShare = remainingCount > 0 ? remainingBudget / remainingCount : 0;
+
+      resolvedPerFrameDurations = perFrameDurations.map((d) =>
+        d !== null ? d : (defaultShare > 0 ? defaultShare : (duration / Math.max(1, imageCount)))
+      );
+
+      const resolvedTotal = resolvedPerFrameDurations.reduce((a, b) => a + b, 0);
+      // If per-frame sums exceed the target (no budget for remaining frames),
+      // expand the final duration to match so nothing gets clipped.
+      if (resolvedTotal > duration) {
+        console.log(`📊 Per-frame durations exceed target (${resolvedTotal.toFixed(2)}s > ${duration}s) — expanding total`);
+        duration = resolvedTotal;
+      }
+    }
+
+    console.log(`📊 Duration: ${imageCount} images, ${duration}s total`, {
+      perFrameDurationsUsed: hasPerFrameDurations,
+      perFrameFiltersUsed: perFrameOverrides.some((ov) => ov && ov.ffmpegFilters),
+    });
+
     // Generate video using working FFmpeg renderer
     return this.renderer.generateVideo({
       images: assets.images,
@@ -129,7 +175,10 @@ class VideoGenerator {
       quality: options.quality || 23,
       imageMode: options.imageMode,
       debug: options.debug,
-      onProgress: options.onProgress
+      onProgress: options.onProgress,
+      // Items 4 & 5 — per-image FFmpeg filter chain + resolved durations.
+      perFrameDurations: resolvedPerFrameDurations,
+      perFrameFilters: perFrameOverrides.map((ov) => ov?.ffmpegFilters || null)
     });
   }
 
