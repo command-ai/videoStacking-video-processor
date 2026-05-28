@@ -137,7 +137,10 @@ export async function processEnhancedVideo(data: EnhancementData) {
       // Get video metadata
       const metadata = await getVideoMetadata(enhancedVideoPath)
       
-      // Update video record
+      // Update video record. Clear `error` because a retried job leaves the
+      // last "at capacity" string from a prior failed attempt — without this
+      // the status response shows status:completed alongside a misleading
+      // error message that no longer applies to the rendered file.
       await prisma.video.update({
         where: { id: videoId },
         data: {
@@ -147,7 +150,8 @@ export async function processEnhancedVideo(data: EnhancementData) {
           duration: metadata.duration,
           fileSize: metadata.fileSize,
           metadata: metadata as any,
-          completedAt: new Date()
+          completedAt: new Date(),
+          error: null
         }
       })
       

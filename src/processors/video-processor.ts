@@ -93,11 +93,42 @@ export async function processVideo(videoId: string, context?: VideoContext) {
     
     // 3. Prepare assets (and map per-frame overrides onto local paths)
     const assets = await prepareAssets(media)
-    
-    // Note: If voice-over audio is generated in the future, add it to assets as:
-    // assets.voiceOver = pathToGeneratedAudioFile
-    // The VideoGenerator will use it if present, otherwise creates silent track
-    
+
+    // 3b. Resolve audio assets — background music and TTS voiceover.
+    //
+    // The frontend posts these under `settings.soundtrack.music` and
+    // `settings.voiceover`. The API layer (videoQueueService) is responsible
+    // for resolving abstract sources ('brand-kit' / 'library' / 'upload' /
+    // 'generate-from-script') into concrete URLs / S3 keys BEFORE dispatching
+    // here. Once we have a URL or s3Key, we download to a local temp file so
+    // FFmpegRenderer can consume it like any other asset.
+    //
+    // Without this block, every base render produced silent video regardless
+    // of UI selection (the previous TODO at this site was never wired up).
+    const audioSettings = {
+      ...((video.settings as any) || {}),
+      ...((context?.settings as any) || {}),
+    }
+    const audioWorkDir = path.join(config.TEMP_DIR || './temp', `audio-${video.id}`)
+    await fs.mkdir(audioWorkDir, { recursive: true })
+    assets.backgroundMusic = await resolveAudioAsset(
+      audioSettings?.soundtrack?.music,
+      audioWorkDir,
+      'music',
+    )
+    assets.voiceOver = await resolveAudioAsset(
+      audioSettings?.voiceover,
+      audioWorkDir,
+      'voiceover',
+    )
+    if (assets.backgroundMusic || assets.voiceOver) {
+      logger.info('Audio assets resolved for base render', {
+        videoId,
+        hasMusic: !!assets.backgroundMusic,
+        hasVoiceover: !!assets.voiceOver,
+      })
+    }
+
     // 4. Import VideoGenerator through ES module wrapper
     const { default: VideoGenerator } = await import('../core/VideoGeneratorWrapper.js')
     
@@ -201,7 +232,8 @@ export async function processVideo(videoId: string, context?: VideoContext) {
     const thumbnailS3Key = `videos/${video.projectId}/${video.id}_thumb.jpg`
     const thumbnailUrl = await uploadToR2(thumbnailPath, thumbnailS3Key, 'image/jpeg')
     
-    // 10. Update database with results
+    // 10. Update database with results. Clear `error` because a retried
+    // job leaves the last "at capacity" string from a prior failed attempt.
     await prisma.video.update({
       where: { id: video.id },
       data: {
@@ -217,7 +249,8 @@ export async function processVideo(videoId: string, context?: VideoContext) {
           fps: metadata.fps
         },
         processingTime: Math.floor((Date.now() - startTime) / 1000),
-        completedAt: new Date()
+        completedAt: new Date(),
+        error: null
       }
     })
     
@@ -370,16 +403,85 @@ async function getVideoMetadata(videoPath: string): Promise<any> {
 
 async function generateThumbnail(videoPath: string, _generator?: any): Promise<string> {
   const thumbnailPath = videoPath.replace('.mp4', '_thumb.jpg')
-  
+
   try {
     // Extract frame at 1 second
     const ffmpegCmd = `ffmpeg -i "${videoPath}" -ss 00:00:01 -vframes 1 -f image2 "${thumbnailPath}" -y`
     execSync(ffmpegCmd)
-    
+
     return thumbnailPath
   } catch (error) {
     logger.error('Failed to generate thumbnail:', error)
     // Return a default thumbnail path or generate a placeholder
     throw error
+  }
+}
+
+/**
+ * Resolve an audio asset (background music or voiceover) referenced by URL
+ * or R2 s3Key into a local file path. Returns undefined when no usable
+ * reference is provided (e.g. UI checked the "skip" / "no music" option) so
+ * the caller can pass it straight to FFmpegRenderer, which treats undefined
+ * as "no track of this kind".
+ *
+ * Accepted input shapes (per current frontend payload):
+ *   { url: "https://..." }       — download via HTTP
+ *   { s3Key: "music/foo.mp3" }   — download from R2
+ *   { audioUrl: "https://..." }  — voiceover-shaped variant
+ *   { source: 'none' }           — explicit skip; returns undefined
+ *
+ * The TTS-from-script path is NOT handled here — the API layer is expected
+ * to pre-synthesize and set `audioUrl` before posting to `/process`. We
+ * don't want this binary depending on the API's TTS providers, and we don't
+ * want every render replica racing to hit OpenAI/ElevenLabs for the same
+ * script. See videoQueueService.ts for the synthesis path.
+ */
+async function resolveAudioAsset(
+  spec: any,
+  workDir: string,
+  label: 'music' | 'voiceover',
+): Promise<string | undefined> {
+  if (!spec || typeof spec !== 'object') return undefined
+  if (spec.source === 'none' || spec.source === 'skip') return undefined
+
+  const url: string | undefined = typeof spec.url === 'string' && spec.url
+    ? spec.url
+    : (typeof spec.audioUrl === 'string' && spec.audioUrl ? spec.audioUrl : undefined)
+  const s3Key: string | undefined = typeof spec.s3Key === 'string' && spec.s3Key
+    ? spec.s3Key
+    : undefined
+
+  if (!url && !s3Key) return undefined
+
+  const ext = label === 'voiceover' ? 'mp3' : 'mp3'
+  const localPath = path.join(workDir, `${label}.${ext}`)
+
+  try {
+    if (url) {
+      logger.info(`Downloading ${label} from URL`, { url })
+      execSync(`curl -L "${url}" -o "${localPath}" --fail --silent --show-error`, {
+        stdio: ['ignore', 'ignore', 'pipe'],
+      })
+    } else if (s3Key) {
+      logger.info(`Downloading ${label} from R2`, { s3Key })
+      const { downloadFromR2 } = await import('../storage/r2-client.js')
+      await downloadFromR2(s3Key, localPath)
+    }
+    const stats = await fs.stat(localPath)
+    if (stats.size < 100) {
+      logger.warn(`${label} file is suspiciously small — skipping`, { size: stats.size })
+      return undefined
+    }
+    return localPath
+  } catch (error) {
+    // Non-fatal: log and continue with silent audio. The render still
+    // produces a valid MP4 — only the audio layer is missing for this
+    // platform. Bubbling here would fail the whole platform render for an
+    // audio glitch, which is a worse UX than "no music this time".
+    logger.error(`Failed to resolve ${label} asset`, {
+      error: error instanceof Error ? error.message : error,
+      spec,
+    })
+    return undefined
   }
 }

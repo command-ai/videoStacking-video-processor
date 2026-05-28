@@ -891,13 +891,24 @@ export class EnhancedVideoProcessor {
       })
     }
     
-    // Mix audio streams
+    // Mix audio streams.
+    //
+    // RULE: when a new voiceover is being overlaid, the source video's audio
+    // is intentionally DROPPED. Field Capture / template videos often ship
+    // with narration already baked into the original track; mixing both
+    // produced two voices talking over each other. The user's intent when
+    // toggling Voiceover is "replace the speech", not "stack a second
+    // narrator on top of the first".
+    //
+    // When voiceover is OFF and only music is being added, the source audio
+    // is preserved (so a narrated video can have background music added
+    // underneath without losing the original voice).
+    const mixInputs = []
+    if (videoInfo.hasAudio && !hasVoiceoverFile) mixInputs.push('[0:a]')
+    if (enhancements.music) mixInputs.push('[music]')
+    if (hasVoiceoverFile) mixInputs.push('[voice]')
+
     if (filterParts.length > 0) {
-      const mixInputs = []
-      if (videoInfo.hasAudio) mixInputs.push('[0:a]')
-      if (enhancements.music) mixInputs.push('[music]')
-      if (hasVoiceoverFile) mixInputs.push('[voice]')
-      
       filterParts.push(`${mixInputs.join('')}amix=inputs=${mixInputs.length}:duration=longest[aout]`)
       
       // Build FFmpeg command with duration handling
