@@ -786,12 +786,30 @@ class FFmpegRenderer {
       // Get image dimensions for proper mode selection
       const imgDimensions = await this.getImageDimensions(img);
 
+      // 'auto' → per-photo fit by aspect mismatch (close→crop, moderate→blur,
+      // severe→letterbox). Same policy as the batch path; resolved here against
+      // this class's IMAGE_MODES. Falls back to blur when dims are unknown.
+      let effectiveMode = imageMode;
+      if (imageMode === this.IMAGE_MODES.AUTO) {
+        if (imgDimensions && imgDimensions.width && imgDimensions.height) {
+          const imgAspect = imgDimensions.width / imgDimensions.height;
+          const vidAspect = videoWidth / videoHeight;
+          const mismatch = Math.abs(imgAspect - vidAspect) / vidAspect;
+          effectiveMode =
+            mismatch < 0.2 ? this.IMAGE_MODES.CROP_FILL
+            : mismatch < 0.5 ? this.IMAGE_MODES.BLUR_BACKGROUND
+            : this.IMAGE_MODES.LETTERBOX;
+        } else {
+          effectiveMode = this.IMAGE_MODES.BLUR_BACKGROUND;
+        }
+      }
+
       // Build proper filter based on image mode
       let videoFilter;
-      if (imageMode === this.IMAGE_MODES.CROP_FILL) {
+      if (effectiveMode === this.IMAGE_MODES.CROP_FILL) {
         // Crop to fill - scale up and crop
         videoFilter = `scale=${videoWidth}:${videoHeight}:force_original_aspect_ratio=increase,crop=${videoWidth}:${videoHeight}`;
-      } else if (imageMode === this.IMAGE_MODES.BLUR_BACKGROUND) {
+      } else if (effectiveMode === this.IMAGE_MODES.BLUR_BACKGROUND) {
         // Blur background mode - preserve full image with blurred background
         const blurStrength = 30;
         videoFilter = `split[bg][fg];[bg]scale=${videoWidth*1.2}:${videoHeight*1.2}:force_original_aspect_ratio=increase,crop=${videoWidth}:${videoHeight},boxblur=${blurStrength}:${blurStrength}[blurred];[fg]scale=${videoWidth}:${videoHeight}:force_original_aspect_ratio=decrease[img];[blurred][img]overlay=(W-w)/2:(H-h)/2`;
@@ -1019,8 +1037,29 @@ class FFmpegRenderer {
         : '';
       const intermediateLabel = frameFilterChain ? `pre_processed${inputIndex}` : `processed${inputIndex}`;
 
+      // 'auto' picks a per-photo fit by how far the photo's aspect is from the
+      // video's: close → crop (fills, negligible loss), moderate → blur fill
+      // (whole photo, no bars), severe → letterbox. Resolved with this class's
+      // own IMAGE_MODES constants (NOT ImageHandlingModes.recommendMode, whose
+      // 'blur_bg' value doesn't match our 'blur_background'). Falls back to blur
+      // when dimensions are unknown (never crops blindly).
+      let effectiveMode = imageMode;
+      if (imageMode === this.IMAGE_MODES.AUTO) {
+        if (imageDims && imageDims.width && imageDims.height) {
+          const imgAspect = imageDims.width / imageDims.height;
+          const vidAspect = videoWidth / videoHeight;
+          const mismatch = Math.abs(imgAspect - vidAspect) / vidAspect;
+          effectiveMode =
+            mismatch < 0.2 ? this.IMAGE_MODES.CROP_FILL
+            : mismatch < 0.5 ? this.IMAGE_MODES.BLUR_BACKGROUND
+            : this.IMAGE_MODES.LETTERBOX;
+        } else {
+          effectiveMode = this.IMAGE_MODES.BLUR_BACKGROUND;
+        }
+      }
+
       let filter;
-      if (imageMode === this.IMAGE_MODES.LETTERBOX && imageDims) {
+      if (effectiveMode === this.IMAGE_MODES.LETTERBOX && imageDims) {
         filter = this.imageHandlingModes.buildLetterboxFilter({
           inputIndex,
           videoWidth,
@@ -1030,7 +1069,7 @@ class FFmpegRenderer {
           backgroundColor: '#2a2a2a'
         });
         filters.push(filter.replace('[letterboxed]', `[${intermediateLabel}]`));
-      } else if (imageMode === this.IMAGE_MODES.BLUR_BACKGROUND) {
+      } else if (effectiveMode === this.IMAGE_MODES.BLUR_BACKGROUND) {
         filter = this.imageHandlingModes.buildBlurBackgroundFilter({
           inputIndex,
           videoWidth,
