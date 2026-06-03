@@ -478,7 +478,10 @@ async function prependIntroClip(
     //    duration drives it). Letterbox-pad to preserve aspect.
     const introNorm = path.join(workDir, 'intro_norm.mp4')
     const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=${fps},format=yuv420p`
-    const vEnc = '-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p'
+    // CRF 18 (near-visually-lossless) so the single intro encode + any
+    // re-encode fallback preserve quality; -preset slow trades time for
+    // efficiency since intros are short.
+    const vEnc = '-c:v libx264 -preset slow -crf 18 -pix_fmt yuv420p'
     if (slideshowHasAudio) {
       if (introHasAudio) {
         execSync(
@@ -499,19 +502,48 @@ async function prependIntroClip(
       )
     }
 
-    // 4. Concat [intro, slideshow]. Both share W×H/fps + audio layout now.
+    // 4. Concat [intro, slideshow]. PREFER stream-copy (concat demuxer): the
+    //    intro_norm was already normalized to the slideshow's W×H/fps/audio
+    //    layout above, so copying avoids re-encoding — the GALLERY stays
+    //    byte-for-byte untouched and the intro is encoded only once (the
+    //    normalize). Verify the joined duration ≈ intro + slideshow; if the
+    //    streams don't line up for a clean copy, fall back to the concat
+    //    filter (re-encodes both, always works).
     const finalPath = path.join(workDir, 'with_intro.mp4')
-    if (slideshowHasAudio) {
-      execSync(
-        `${ffmpegPath} -i "${introNorm}" -i "${slideshowPath}" -filter_complex "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]" -map "[v]" -map "[a]" ${vEnc} -c:a aac -ar 48000 -ac 2 -y "${finalPath}"`,
-        { stdio: ['ignore', 'ignore', 'pipe'] },
-      )
-    } else {
-      execSync(
-        `${ffmpegPath} -i "${introNorm}" -i "${slideshowPath}" -filter_complex "[0:v][1:v]concat=n=2:v=1:a=0[v]" -map "[v]" ${vEnc} -y "${finalPath}"`,
-        { stdio: ['ignore', 'ignore', 'pipe'] },
-      )
+    const introDur = (await getVideoMetadata(introNorm)).duration || 0
+    const slideDur = (await getVideoMetadata(slideshowPath)).duration || 0
+    const expectedDur = introDur + slideDur
+    let usedCopy = false
+    if (expectedDur > 0) {
+      try {
+        const listPath = path.join(workDir, 'concat_list.txt')
+        await fs.writeFile(listPath, `file '${introNorm}'\nfile '${slideshowPath}'\n`)
+        execSync(
+          `${ffmpegPath} -f concat -safe 0 -i "${listPath}" -c copy -movflags +faststart -y "${finalPath}"`,
+          { stdio: ['ignore', 'ignore', 'pipe'] },
+        )
+        const gotDur = (await getVideoMetadata(finalPath)).duration || 0
+        // Within ~0.7s ⇒ clean copy. Otherwise the streams didn't join cleanly.
+        usedCopy = Math.abs(gotDur - expectedDur) <= 0.7
+      } catch {
+        usedCopy = false
+      }
     }
+    if (!usedCopy) {
+      // Re-encode fallback (robust; re-encodes both streams).
+      if (slideshowHasAudio) {
+        execSync(
+          `${ffmpegPath} -i "${introNorm}" -i "${slideshowPath}" -filter_complex "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]" -map "[v]" -map "[a]" ${vEnc} -c:a aac -ar 48000 -ac 2 -movflags +faststart -y "${finalPath}"`,
+          { stdio: ['ignore', 'ignore', 'pipe'] },
+        )
+      } else {
+        execSync(
+          `${ffmpegPath} -i "${introNorm}" -i "${slideshowPath}" -filter_complex "[0:v][1:v]concat=n=2:v=1:a=0[v]" -map "[v]" ${vEnc} -movflags +faststart -y "${finalPath}"`,
+          { stdio: ['ignore', 'ignore', 'pipe'] },
+        )
+      }
+    }
+    logger.info('Intro concat method', { method: usedCopy ? 'stream-copy (gallery untouched)' : 're-encode (fallback)' })
     await fs.stat(finalPath)
     logger.info('Intro clip prepended', { introUrl, w, h, fps, slideshowHasAudio, introHasAudio })
     return finalPath
