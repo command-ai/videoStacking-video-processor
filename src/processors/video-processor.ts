@@ -219,16 +219,33 @@ export async function processVideo(videoId: string, context?: VideoContext) {
       } as VideoProcessingOptions
     )
     
+    // 6b. Intro: when a full-length intro clip was supplied, normalize it to
+    // this render's resolution/fps and concat it in front. GUARDED by
+    // settings.intro.url — renders without an intro skip this entirely and are
+    // byte-identical. Best-effort: a failure falls back to the intro-less slideshow.
+    let finalPath = outputPath
+    const introUrl: string | undefined =
+      combinedSettings?.intro && typeof combinedSettings.intro.url === 'string' && combinedSettings.intro.url
+        ? combinedSettings.intro.url
+        : typeof combinedSettings?.introVideo === 'string' && combinedSettings.introVideo
+          ? combinedSettings.introVideo
+          : undefined
+    if (introUrl) {
+      logger.info('Prepending intro clip', { videoId, introUrl })
+      const introWorkDir = path.join(config.TEMP_DIR || './temp', `intro-${video.id}`)
+      finalPath = await prependIntroClip(outputPath, introUrl, config.FFMPEG_PATH || 'ffmpeg', introWorkDir)
+    }
+
     // 7. Get video metadata
-    const stats = await fs.stat(outputPath)
-    const metadata = await getVideoMetadata(outputPath)
-    
+    const stats = await fs.stat(finalPath)
+    const metadata = await getVideoMetadata(finalPath)
+
     // 8. Upload to R2/S3
     const s3Key = `videos/${video.projectId}/${video.id}.mp4`
-    const videoUrl = await uploadToR2(outputPath, s3Key, 'video/mp4')
+    const videoUrl = await uploadToR2(finalPath, s3Key, 'video/mp4')
 
     // 9. Generate thumbnail
-    const thumbnailPath = await generateThumbnail(outputPath)
+    const thumbnailPath = await generateThumbnail(finalPath)
     const thumbnailS3Key = `videos/${video.projectId}/${video.id}_thumb.jpg`
     const thumbnailUrl = await uploadToR2(thumbnailPath, thumbnailS3Key, 'image/jpeg')
     
@@ -255,7 +272,8 @@ export async function processVideo(videoId: string, context?: VideoContext) {
     })
     
     // 11. Cleanup temp files
-    await fs.unlink(outputPath).catch(() => {})
+    await fs.unlink(finalPath).catch(() => {})
+    if (finalPath !== outputPath) await fs.unlink(outputPath).catch(() => {})
     await fs.unlink(thumbnailPath).catch(() => {})
     
     logger.info(`Video generation completed for video ${videoId}`, {
@@ -398,6 +416,111 @@ async function getVideoMetadata(videoPath: string): Promise<any> {
       bitrate: 0,
       fps: 0
     }
+  }
+}
+
+/**
+ * Prepend a FULL-LENGTH client intro clip to the rendered slideshow.
+ *
+ * The clip can be any resolution / fps / codec and may or may not carry audio,
+ * so we NORMALIZE it to the slideshow's exact W×H + fps (letterbox-padded to
+ * preserve aspect), then concat [intro, slideshow]. Audio is matched to the
+ * slideshow: if the slideshow has sound the intro keeps its own audio (or a
+ * silent track so the streams line up); if the slideshow is silent the intro is
+ * muxed silent too — otherwise the concat filter's stream layouts wouldn't match.
+ *
+ * Best-effort: returns the ORIGINAL slideshow path on any failure. An intro
+ * glitch must never fail the whole render. Only invoked when settings.intro.url
+ * is present, so non-intro renders never touch this code.
+ */
+async function prependIntroClip(
+  slideshowPath: string,
+  introUrl: string,
+  ffmpegPath: string,
+  workDir: string,
+): Promise<string> {
+  const hasAudioStream = (p: string): boolean => {
+    try {
+      return execSync(
+        `ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "${p}"`,
+      ).toString().trim().length > 0
+    } catch {
+      return false
+    }
+  }
+
+  try {
+    await fs.mkdir(workDir, { recursive: true })
+
+    // 1. Download the clip.
+    const introRaw = path.join(workDir, 'intro_raw')
+    execSync(`curl -L "${introUrl}" -o "${introRaw}" --fail --silent --show-error`, {
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+    if ((await fs.stat(introRaw)).size < 1000) {
+      logger.warn('Intro clip too small/empty — skipping', { introUrl })
+      return slideshowPath
+    }
+
+    // 2. Match the slideshow's geometry.
+    const meta = await getVideoMetadata(slideshowPath)
+    const [w, h] = String(meta.resolution).split('x').map((n) => parseInt(n, 10))
+    const fps = Math.round(Number(meta.fps)) || 30
+    if (!w || !h) {
+      logger.warn('Could not read slideshow dimensions — skipping intro', { resolution: meta.resolution })
+      return slideshowPath
+    }
+
+    const slideshowHasAudio = hasAudioStream(slideshowPath)
+    const introHasAudio = hasAudioStream(introRaw)
+
+    // 3. Normalize the intro to W×H/fps (full length — no -t; the clip's own
+    //    duration drives it). Letterbox-pad to preserve aspect.
+    const introNorm = path.join(workDir, 'intro_norm.mp4')
+    const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=${fps},format=yuv420p`
+    const vEnc = '-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p'
+    if (slideshowHasAudio) {
+      if (introHasAudio) {
+        execSync(
+          `${ffmpegPath} -i "${introRaw}" -map 0:v:0 -map 0:a:0 -vf "${vf}" ${vEnc} -c:a aac -ar 48000 -ac 2 -y "${introNorm}"`,
+          { stdio: ['ignore', 'ignore', 'pipe'] },
+        )
+      } else {
+        // Synthesize a silent track sized to the clip (-shortest trims it).
+        execSync(
+          `${ffmpegPath} -i "${introRaw}" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -map 0:v:0 -map 1:a:0 -vf "${vf}" ${vEnc} -c:a aac -ar 48000 -ac 2 -shortest -y "${introNorm}"`,
+          { stdio: ['ignore', 'ignore', 'pipe'] },
+        )
+      }
+    } else {
+      execSync(
+        `${ffmpegPath} -i "${introRaw}" -map 0:v:0 -an -vf "${vf}" ${vEnc} -y "${introNorm}"`,
+        { stdio: ['ignore', 'ignore', 'pipe'] },
+      )
+    }
+
+    // 4. Concat [intro, slideshow]. Both share W×H/fps + audio layout now.
+    const finalPath = path.join(workDir, 'with_intro.mp4')
+    if (slideshowHasAudio) {
+      execSync(
+        `${ffmpegPath} -i "${introNorm}" -i "${slideshowPath}" -filter_complex "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]" -map "[v]" -map "[a]" ${vEnc} -c:a aac -ar 48000 -ac 2 -y "${finalPath}"`,
+        { stdio: ['ignore', 'ignore', 'pipe'] },
+      )
+    } else {
+      execSync(
+        `${ffmpegPath} -i "${introNorm}" -i "${slideshowPath}" -filter_complex "[0:v][1:v]concat=n=2:v=1:a=0[v]" -map "[v]" ${vEnc} -y "${finalPath}"`,
+        { stdio: ['ignore', 'ignore', 'pipe'] },
+      )
+    }
+    await fs.stat(finalPath)
+    logger.info('Intro clip prepended', { introUrl, w, h, fps, slideshowHasAudio, introHasAudio })
+    return finalPath
+  } catch (error) {
+    logger.error('Failed to prepend intro — rendering without it', {
+      error: error instanceof Error ? error.message : error,
+      introUrl,
+    })
+    return slideshowPath
   }
 }
 
