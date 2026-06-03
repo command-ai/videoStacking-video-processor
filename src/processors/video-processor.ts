@@ -224,16 +224,40 @@ export async function processVideo(videoId: string, context?: VideoContext) {
     // settings.intro.url — renders without an intro skip this entirely and are
     // byte-identical. Best-effort: a failure falls back to the intro-less slideshow.
     let finalPath = outputPath
-    const introUrl: string | undefined =
-      combinedSettings?.intro && typeof combinedSettings.intro.url === 'string' && combinedSettings.intro.url
-        ? combinedSettings.intro.url
-        : typeof combinedSettings?.introVideo === 'string' && combinedSettings.introVideo
-          ? combinedSettings.introVideo
-          : undefined
-    if (introUrl) {
-      logger.info('Prepending intro clip', { videoId, introUrl })
+    // Resolve the intro into an ordered segment list. New shape:
+    // settings.intro.segments[] (video clips + timed images). Legacy single-clip
+    // (intro.url / introVideo string) is wrapped as one video segment.
+    const introCfg = combinedSettings?.intro
+    let introSegments: IntroSeg[] = []
+    if (introCfg && Array.isArray(introCfg.segments) && introCfg.segments.length > 0) {
+      introSegments = introCfg.segments
+        .filter((s: any) => s && typeof s.url === 'string' && s.url)
+        .map((s: any) => ({
+          kind: s.kind === 'image' ? 'image' : 'video',
+          url: s.url as string,
+          durationSeconds: typeof s.durationSeconds === 'number' ? s.durationSeconds : undefined,
+          keepAudio: typeof s.keepAudio === 'boolean' ? s.keepAudio : undefined,
+        }))
+    } else {
+      const legacyUrl: string | undefined =
+        introCfg && typeof introCfg.url === 'string' && introCfg.url
+          ? introCfg.url
+          : typeof combinedSettings?.introVideo === 'string' && combinedSettings.introVideo
+            ? combinedSettings.introVideo
+            : undefined
+      if (legacyUrl) {
+        introSegments = [{
+          kind: 'video',
+          url: legacyUrl,
+          durationSeconds: typeof introCfg?.durationSeconds === 'number' ? introCfg.durationSeconds : undefined,
+          keepAudio: typeof introCfg?.keepAudio === 'boolean' ? introCfg.keepAudio : undefined,
+        }]
+      }
+    }
+    if (introSegments.length > 0) {
+      logger.info('Prepending intro', { videoId, segments: introSegments.length })
       const introWorkDir = path.join(config.TEMP_DIR || './temp', `intro-${video.id}`)
-      finalPath = await prependIntroClip(outputPath, introUrl, config.FFMPEG_PATH || 'ffmpeg', introWorkDir)
+      finalPath = await prependIntroSegments(outputPath, introSegments, config.FFMPEG_PATH || 'ffmpeg', introWorkDir)
     }
 
     // 7. Get video metadata
@@ -433,9 +457,28 @@ async function getVideoMetadata(videoPath: string): Promise<any> {
  * glitch must never fail the whole render. Only invoked when settings.intro.url
  * is present, so non-intro renders never touch this code.
  */
-async function prependIntroClip(
+interface IntroSeg {
+  kind: 'video' | 'image'
+  url: string
+  durationSeconds?: number
+  keepAudio?: boolean
+}
+
+/**
+ * Prepend an ordered list of intro segments (video clips + timed images) to the
+ * slideshow. Each segment is normalized to the slideshow's exact W×H/fps and a
+ * consistent audio layout (silent stereo for images / audioless clips when the
+ * slideshow has audio), then ALL segments + the slideshow are concatenated.
+ *
+ * Prefers the concat demuxer with stream-copy (every segment was pre-normalized
+ * to the slideshow's layout, so the GALLERY stays byte-for-byte untouched and
+ * each segment is encoded only once), falling back to a re-encode concat filter
+ * if the joined duration doesn't line up. Best-effort: a single bad segment is
+ * skipped; total failure falls back to the intro-less slideshow.
+ */
+async function prependIntroSegments(
   slideshowPath: string,
-  introUrl: string,
+  segments: IntroSeg[],
   ffmpegPath: string,
   workDir: string,
 ): Promise<string> {
@@ -450,19 +493,10 @@ async function prependIntroClip(
   }
 
   try {
+    if (segments.length === 0) return slideshowPath
     await fs.mkdir(workDir, { recursive: true })
 
-    // 1. Download the clip.
-    const introRaw = path.join(workDir, 'intro_raw')
-    execSync(`curl -L "${introUrl}" -o "${introRaw}" --fail --silent --show-error`, {
-      stdio: ['ignore', 'ignore', 'pipe'],
-    })
-    if ((await fs.stat(introRaw)).size < 1000) {
-      logger.warn('Intro clip too small/empty — skipping', { introUrl })
-      return slideshowPath
-    }
-
-    // 2. Match the slideshow's geometry.
+    // Match the slideshow's geometry — the normalization target for every segment.
     const meta = await getVideoMetadata(slideshowPath)
     const [w, h] = String(meta.resolution).split('x').map((n) => parseInt(n, 10))
     const fps = Math.round(Number(meta.fps)) || 30
@@ -470,87 +504,139 @@ async function prependIntroClip(
       logger.warn('Could not read slideshow dimensions — skipping intro', { resolution: meta.resolution })
       return slideshowPath
     }
-
     const slideshowHasAudio = hasAudioStream(slideshowPath)
-    const introHasAudio = hasAudioStream(introRaw)
-
-    // 3. Normalize the intro to W×H/fps (full length — no -t; the clip's own
-    //    duration drives it). Letterbox-pad to preserve aspect.
-    const introNorm = path.join(workDir, 'intro_norm.mp4')
     const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=${fps},format=yuv420p`
-    // CRF 18 (near-visually-lossless) so the single intro encode + any
-    // re-encode fallback preserve quality; -preset slow trades time for
-    // efficiency since intros are short.
     const vEnc = '-c:v libx264 -preset slow -crf 18 -pix_fmt yuv420p'
-    if (slideshowHasAudio) {
-      if (introHasAudio) {
-        execSync(
-          `${ffmpegPath} -i "${introRaw}" -map 0:v:0 -map 0:a:0 -vf "${vf}" ${vEnc} -c:a aac -ar 48000 -ac 2 -y "${introNorm}"`,
-          { stdio: ['ignore', 'ignore', 'pipe'] },
-        )
-      } else {
-        // Synthesize a silent track sized to the clip (-shortest trims it).
-        execSync(
-          `${ffmpegPath} -i "${introRaw}" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -map 0:v:0 -map 1:a:0 -vf "${vf}" ${vEnc} -c:a aac -ar 48000 -ac 2 -shortest -y "${introNorm}"`,
-          { stdio: ['ignore', 'ignore', 'pipe'] },
-        )
+
+    // Normalize each segment to a W×H/fps clip with a consistent audio layout.
+    const normPaths: string[] = []
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i]
+      if (!seg?.url) continue
+      const raw = path.join(workDir, `seg_raw_${i}`)
+      try {
+        execSync(`curl -L "${seg.url}" -o "${raw}" --fail --silent --show-error`, {
+          stdio: ['ignore', 'ignore', 'pipe'],
+        })
+        if ((await fs.stat(raw)).size < 100) {
+          logger.warn('Intro segment too small/empty — skipping', { i, url: seg.url })
+          continue
+        }
+      } catch {
+        logger.warn('Intro segment download failed — skipping', { i, url: seg.url })
+        continue
       }
-    } else {
-      execSync(
-        `${ffmpegPath} -i "${introRaw}" -map 0:v:0 -an -vf "${vf}" ${vEnc} -y "${introNorm}"`,
-        { stdio: ['ignore', 'ignore', 'pipe'] },
-      )
+
+      const norm = path.join(workDir, `seg_norm_${i}.mp4`)
+      try {
+        if (seg.kind === 'image') {
+          // Still image → a clip of `durationSeconds` (default 3s).
+          const dur = Number(seg.durationSeconds) > 0 ? Number(seg.durationSeconds) : 3
+          if (slideshowHasAudio) {
+            execSync(
+              `${ffmpegPath} -loop 1 -i "${raw}" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -map 0:v:0 -map 1:a:0 -t ${dur} -vf "${vf}" ${vEnc} -c:a aac -ar 48000 -ac 2 -y "${norm}"`,
+              { stdio: ['ignore', 'ignore', 'pipe'] },
+            )
+          } else {
+            execSync(
+              `${ffmpegPath} -loop 1 -i "${raw}" -t ${dur} -vf "${vf}" ${vEnc} -an -y "${norm}"`,
+              { stdio: ['ignore', 'ignore', 'pipe'] },
+            )
+          }
+        } else {
+          // Video clip — optional trim to durationSeconds, else its natural length.
+          const trim = Number(seg.durationSeconds) > 0 ? `-t ${Number(seg.durationSeconds)}` : ''
+          const segHasAudio = hasAudioStream(raw)
+          const keep = seg.keepAudio !== false
+          if (slideshowHasAudio && segHasAudio && keep) {
+            execSync(
+              `${ffmpegPath} -i "${raw}" -map 0:v:0 -map 0:a:0 -vf "${vf}" ${vEnc} -c:a aac -ar 48000 -ac 2 ${trim} -y "${norm}"`,
+              { stdio: ['ignore', 'ignore', 'pipe'] },
+            )
+          } else if (slideshowHasAudio) {
+            execSync(
+              `${ffmpegPath} -i "${raw}" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -map 0:v:0 -map 1:a:0 -vf "${vf}" ${vEnc} -c:a aac -ar 48000 -ac 2 -shortest ${trim} -y "${norm}"`,
+              { stdio: ['ignore', 'ignore', 'pipe'] },
+            )
+          } else {
+            execSync(
+              `${ffmpegPath} -i "${raw}" -map 0:v:0 -an -vf "${vf}" ${vEnc} ${trim} -y "${norm}"`,
+              { stdio: ['ignore', 'ignore', 'pipe'] },
+            )
+          }
+        }
+        await fs.stat(norm)
+        normPaths.push(norm)
+      } catch (e) {
+        logger.warn('Intro segment normalize failed — skipping', {
+          i,
+          kind: seg.kind,
+          error: e instanceof Error ? e.message : e,
+        })
+      }
     }
 
-    // 4. Concat [intro, slideshow]. PREFER stream-copy (concat demuxer): the
-    //    intro_norm was already normalized to the slideshow's W×H/fps/audio
-    //    layout above, so copying avoids re-encoding — the GALLERY stays
-    //    byte-for-byte untouched and the intro is encoded only once (the
-    //    normalize). Verify the joined duration ≈ intro + slideshow; if the
-    //    streams don't line up for a clean copy, fall back to the concat
-    //    filter (re-encodes both, always works).
+    if (normPaths.length === 0) {
+      logger.warn('No intro segments survived normalization — rendering without intro')
+      return slideshowPath
+    }
+
+    // Concat [seg_0…seg_N, slideshow]. Prefer stream-copy (every segment was
+    // normalized to the slideshow's layout → gallery untouched), verify total
+    // duration ≈ Σ(segments) + slideshow, else re-encode concat filter (n=N+1).
     const finalPath = path.join(workDir, 'with_intro.mp4')
-    const introDur = (await getVideoMetadata(introNorm)).duration || 0
+    let introDur = 0
+    for (const p of normPaths) introDur += (await getVideoMetadata(p)).duration || 0
     const slideDur = (await getVideoMetadata(slideshowPath)).duration || 0
     const expectedDur = introDur + slideDur
     let usedCopy = false
     if (expectedDur > 0) {
       try {
         const listPath = path.join(workDir, 'concat_list.txt')
-        await fs.writeFile(listPath, `file '${introNorm}'\nfile '${slideshowPath}'\n`)
+        const lines = [...normPaths.map((p) => `file '${p}'`), `file '${slideshowPath}'`].join('\n') + '\n'
+        await fs.writeFile(listPath, lines)
         execSync(
           `${ffmpegPath} -f concat -safe 0 -i "${listPath}" -c copy -movflags +faststart -y "${finalPath}"`,
           { stdio: ['ignore', 'ignore', 'pipe'] },
         )
         const gotDur = (await getVideoMetadata(finalPath)).duration || 0
-        // Within ~0.7s ⇒ clean copy. Otherwise the streams didn't join cleanly.
-        usedCopy = Math.abs(gotDur - expectedDur) <= 0.7
+        // Per-segment boundary slack scales with segment count.
+        usedCopy = Math.abs(gotDur - expectedDur) <= 0.7 + normPaths.length * 0.1
       } catch {
         usedCopy = false
       }
     }
     if (!usedCopy) {
-      // Re-encode fallback (robust; re-encodes both streams).
+      const inputs = [...normPaths, slideshowPath]
+      const inFlags = inputs.map((p) => `-i "${p}"`).join(' ')
+      const n = inputs.length
       if (slideshowHasAudio) {
+        const streams = inputs.map((_, i) => `[${i}:v][${i}:a]`).join('')
         execSync(
-          `${ffmpegPath} -i "${introNorm}" -i "${slideshowPath}" -filter_complex "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]" -map "[v]" -map "[a]" ${vEnc} -c:a aac -ar 48000 -ac 2 -movflags +faststart -y "${finalPath}"`,
+          `${ffmpegPath} ${inFlags} -filter_complex "${streams}concat=n=${n}:v=1:a=1[v][a]" -map "[v]" -map "[a]" ${vEnc} -c:a aac -ar 48000 -ac 2 -movflags +faststart -y "${finalPath}"`,
           { stdio: ['ignore', 'ignore', 'pipe'] },
         )
       } else {
+        const streams = inputs.map((_, i) => `[${i}:v]`).join('')
         execSync(
-          `${ffmpegPath} -i "${introNorm}" -i "${slideshowPath}" -filter_complex "[0:v][1:v]concat=n=2:v=1:a=0[v]" -map "[v]" ${vEnc} -movflags +faststart -y "${finalPath}"`,
+          `${ffmpegPath} ${inFlags} -filter_complex "${streams}concat=n=${n}:v=1:a=0[v]" -map "[v]" ${vEnc} -movflags +faststart -y "${finalPath}"`,
           { stdio: ['ignore', 'ignore', 'pipe'] },
         )
       }
     }
-    logger.info('Intro concat method', { method: usedCopy ? 'stream-copy (gallery untouched)' : 're-encode (fallback)' })
     await fs.stat(finalPath)
-    logger.info('Intro clip prepended', { introUrl, w, h, fps, slideshowHasAudio, introHasAudio })
+    logger.info('Intro segments prepended', {
+      count: normPaths.length,
+      method: usedCopy ? 'stream-copy (gallery untouched)' : 're-encode (fallback)',
+      w,
+      h,
+      fps,
+      slideshowHasAudio,
+    })
     return finalPath
   } catch (error) {
-    logger.error('Failed to prepend intro — rendering without it', {
+    logger.error('Failed to prepend intro segments — rendering without it', {
       error: error instanceof Error ? error.message : error,
-      introUrl,
     })
     return slideshowPath
   }
