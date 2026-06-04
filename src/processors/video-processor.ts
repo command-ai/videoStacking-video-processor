@@ -197,6 +197,30 @@ export async function processVideo(videoId: string, context?: VideoContext) {
       }
     }
 
+    // Music-over-intro: FFmpeg is linear. The body slideshow is rendered first,
+    // then the intro is concatenated in FRONT of it (prependIntroSegments). If
+    // the background music is baked into the body it inherits the body's start
+    // and plays BEHIND the intro (the reported bug). So when an intro is
+    // configured we DEFER the music: render the body without it, then mix the
+    // looped, ducked bed over the whole [intro+body] timeline in a final pass
+    // (mixMusicOverFull). This matches the Remotion engine, where composition-
+    // level audio already spans every slot including the intro. The voiceover
+    // stays baked in the body — its body-relative timing is already correct, and
+    // it becomes the sidechain key that ducks the bed in the final pass.
+    const introConfigured = !!(
+      combinedSettings?.intro &&
+      ((Array.isArray(combinedSettings.intro.segments) &&
+        combinedSettings.intro.segments.some((s: any) => s && s.url)) ||
+        (typeof combinedSettings.intro.url === 'string' && combinedSettings.intro.url) ||
+        (typeof combinedSettings.introVideo === 'string' && combinedSettings.introVideo))
+    )
+    let deferredMusic: string | null = null
+    if (introConfigured && assets.backgroundMusic) {
+      deferredMusic = assets.backgroundMusic
+      assets.backgroundMusic = null
+      logger.info('Deferring background music to final pass (music spans intro)', { videoId })
+    }
+
     const outputPath = await generator.generateVideo(
       context?.platform || video.platform,
       assets,
@@ -258,6 +282,32 @@ export async function processVideo(videoId: string, context?: VideoContext) {
       logger.info('Prepending intro', { videoId, segments: introSegments.length })
       const introWorkDir = path.join(config.TEMP_DIR || './temp', `intro-${video.id}`)
       finalPath = await prependIntroSegments(outputPath, introSegments, config.FFMPEG_PATH || 'ffmpeg', introWorkDir)
+    }
+
+    // 6c. Music-over-intro final pass: mix the deferred background music over the
+    // FULL [intro+body] timeline, looped to fill and sidechain-ducked under the
+    // voiceover/clip audio already on the track. Video is stream-copied (already
+    // final) — audio-only re-encode. Best-effort: on failure keep the music-less
+    // finalPath rather than fail the render.
+    if (deferredMusic && finalPath && introSegments.length > 0) {
+      try {
+        const mixWorkDir = path.join(config.TEMP_DIR || './temp', `musicmix-${video.id}`)
+        const mixedPath = await mixMusicOverFull(
+          finalPath,
+          deferredMusic,
+          config.FFMPEG_PATH || 'ffmpeg',
+          mixWorkDir,
+        )
+        if (mixedPath !== finalPath) {
+          if (finalPath !== outputPath) await fs.unlink(finalPath).catch(() => {})
+          finalPath = mixedPath
+        }
+      } catch (e) {
+        logger.warn('Music-over-intro final pass failed; shipping intro+body without music bed', {
+          videoId,
+          error: e instanceof Error ? e.message : String(e),
+        })
+      }
     }
 
     // 7. Get video metadata
@@ -441,6 +491,87 @@ async function getVideoMetadata(videoPath: string): Promise<any> {
       fps: 0
     }
   }
+}
+
+/**
+ * Final-pass audio mix: lay a looped background-music bed over the ENTIRE
+ * finished video (intro + body) and duck it under whatever speech/clip audio
+ * is already on the track.
+ *
+ * Why a separate pass (not baked into the body): FFmpeg is linear. The body is
+ * rendered first, then the intro is concatenated in FRONT of it. Music baked
+ * into the body inherits the body's start and plays BEHIND the intro. Mixing
+ * here — after the concat, over the full timeline — is the only place the bed
+ * can span the intro. (Remotion gets this free: its music <Audio> is mounted at
+ * composition level, above every slot.)
+ *
+ * Ducking via sidechaincompress, NOT amix auto-normalize: amix with
+ * `duration=longest` renormalizes volume when an input drops out (the ~2s
+ * `dropout_transition`), making the bed audibly SWELL the moment the voiceover
+ * ends. Instead we split the existing track, key a sidechain compressor on the
+ * speech, and amix with `normalize=0` so levels are deterministic and the bed
+ * never pumps.
+ *
+ * The concat track carries audio when the body had a voiceover (silent intro
+ * region + VO body region). When there's no speech anywhere the track may be
+ * absent, so we probe for it: with speech we duck; without, the looped music IS
+ * the audio. Video is stream-copied (`-c:v copy`) — audio-only re-encode.
+ */
+async function mixMusicOverFull(
+  videoPath: string,
+  musicPath: string,
+  ffmpegPath: string,
+  workDir: string,
+): Promise<string> {
+  await fs.mkdir(workDir, { recursive: true })
+  const total = (await getVideoMetadata(videoPath)).duration || 0
+  if (!(total > 0)) {
+    logger.warn('mixMusicOverFull: could not read total duration — skipping music bed')
+    return videoPath
+  }
+  const fadeStart = Math.max(0, total - 1.5)
+  const outPath = path.join(workDir, 'with_music.mp4')
+
+  const hasSpeech = (() => {
+    try {
+      return (
+        execSync(
+          `ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "${videoPath}"`,
+        )
+          .toString()
+          .trim().length > 0
+      )
+    } catch {
+      return false
+    }
+  })()
+
+  // [1:a] = music, looped (-stream_loop -1) to outlast the video; base level
+  // 0.15 with a 1s fade-in and a 1.5s tail fade-out.
+  let filter: string
+  if (hasSpeech) {
+    // Duck the bed under the existing speech track. asplit so [0:a] both keys
+    // the sidechain and stays in the final mix. normalize=0 → no amix pumping.
+    filter = [
+      `[0:a]asplit=2[a_main][a_key]`,
+      `[1:a]volume=0.15,afade=t=in:st=0:d=1,afade=t=out:st=${fadeStart.toFixed(3)}:d=1.5[bed]`,
+      `[bed][a_key]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=400[bed_ducked]`,
+      `[a_main][bed_ducked]amix=inputs=2:duration=first:normalize=0[aout]`,
+    ].join(';')
+  } else {
+    // No speech — the looped, faded music IS the audio track.
+    filter = `[1:a]volume=0.15,afade=t=in:st=0:d=1,afade=t=out:st=${fadeStart.toFixed(3)}:d=1.5[aout]`
+  }
+
+  const cmd =
+    `${ffmpegPath} -i "${videoPath}" -stream_loop -1 -i "${musicPath}" ` +
+    `-filter_complex "${filter}" -map 0:v -map "[aout]" ` +
+    `-c:v copy -c:a aac -b:a 192k -ar 48000 -ac 2 -movflags +faststart -t ${total.toFixed(3)} -y "${outPath}"`
+
+  logger.info('mixMusicOverFull: laying ducked music bed over full timeline', { total, hasSpeech })
+  execSync(cmd, { stdio: ['ignore', 'ignore', 'pipe'] })
+  await fs.stat(outPath)
+  return outPath
 }
 
 /**
