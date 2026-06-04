@@ -552,8 +552,23 @@ async function mixMusicOverFull(
   if (hasSpeech) {
     // Duck the bed under the existing speech track. asplit so [0:a] both keys
     // the sidechain and stays in the final mix. normalize=0 → no amix pumping.
+    //
+    // CRITICAL length handling: the body's audio track ([0:a]) is only as long
+    // as the voiceover (~speech length), but the body VIDEO is stretched to the
+    // platform's target duration — so [0:a] can be far shorter than `total`
+    // (e.g. 19s of VO under a 63s video). Two traps that truncate the mix:
+    //   1) sidechaincompress ends when its sidechain KEY input ends, so a short
+    //      key would cut the ducked bed off early.
+    //   2) amix=duration=first ends the output when the first input ends.
+    // We pad BOTH the mix copy (a_main) and the sidechain key (a_key) to `total`
+    // with apad (silence after the speech) so the compressor runs the full
+    // length and amix spans the whole video. After the speech ends the padded
+    // key is silent → no ducking → the bed returns to full volume. `-t total`
+    // remains a final safety bound.
     filter = [
-      `[0:a]asplit=2[a_main][a_key]`,
+      `[0:a]asplit=2[m0][k0]`,
+      `[m0]apad=whole_dur=${total.toFixed(3)}[a_main]`,
+      `[k0]apad=whole_dur=${total.toFixed(3)}[a_key]`,
       `[1:a]volume=0.15,afade=t=in:st=0:d=1,afade=t=out:st=${fadeStart.toFixed(3)}:d=1.5[bed]`,
       `[bed][a_key]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=400[bed_ducked]`,
       `[a_main][bed_ducked]amix=inputs=2:duration=first:normalize=0[aout]`,
