@@ -6,6 +6,20 @@ import path from 'path'
 import fs from 'fs/promises'
 import { execSync } from 'child_process'
 
+// Every ffmpeg/ffprobe/curl invocation is synchronous and blocks the event
+// loop. Without a timeout, a stalled subprocess (hung download, wedged ffmpeg)
+// freezes the render in "processing" forever with no error. Bounding each call
+// makes it throw on overrun → the render fails cleanly and can be retried.
+const SUBPROCESS_TIMEOUT_MS = Number(process.env.FFMPEG_TIMEOUT_MS) || 8 * 60 * 1000
+function execSyncBounded(cmd: string, opts: Record<string, any> = {}): Buffer {
+  return execSync(cmd, { timeout: SUBPROCESS_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts }) as unknown as Buffer
+}
+
+// Overall ceiling for one render. A backstop above the per-subprocess timeouts:
+// if anything async stalls (and isn't a blocking execSync), this marks the row
+// failed instead of leaving it stuck in "processing".
+const RENDER_WATCHDOG_MS = Number(process.env.RENDER_WATCHDOG_MS) || 12 * 60 * 1000
+
 interface FrameOverride {
   duration?: number
   ffmpegFilters?: {
@@ -36,7 +50,20 @@ interface VideoContext {
 
 export async function processVideo(videoId: string, context?: VideoContext) {
   const startTime = Date.now()
-  
+  // Backstop: if the render runs past the ceiling (an async stall not caught by
+  // the per-subprocess timeouts), flip the row to failed so it never lingers in
+  // "processing". The work may still unwind, but the user-visible state is no
+  // longer a zombie.
+  let watchdog: NodeJS.Timeout | undefined = setTimeout(() => {
+    watchdog = undefined
+    logger.error(`Render watchdog fired for video ${videoId} after ${RENDER_WATCHDOG_MS}ms — marking failed`)
+    prisma.video.updateMany({
+      where: { id: videoId, status: 'processing' },
+      data: { status: 'failed', error: `Render exceeded ${Math.floor(RENDER_WATCHDOG_MS / 1000)}s timeout`, completedAt: new Date() },
+    }).catch((e) => logger.error('Watchdog failed to update row:', e))
+  }, RENDER_WATCHDOG_MS)
+  if (typeof watchdog.unref === 'function') watchdog.unref()
+
   try {
     // Debug: Check database connection and list videos
     logger.info('Database URL:', process.env.DATABASE_URL?.replace(/:[^@]+@/, ':***@'))
@@ -62,7 +89,8 @@ export async function processVideo(videoId: string, context?: VideoContext) {
     })
     
     logger.info(`Starting video generation for video ${videoId}`, {
-      projectId: video.projectId,
+      generationId: video.generationId,
+      organizationId: video.organizationId,
       platform: video.platform,
       mediaIds: video.mediaIds
     })
@@ -314,13 +342,13 @@ export async function processVideo(videoId: string, context?: VideoContext) {
     const stats = await fs.stat(finalPath)
     const metadata = await getVideoMetadata(finalPath)
 
-    // 8. Upload to R2/S3
-    const s3Key = `videos/${video.projectId}/${video.id}.mp4`
+    // 8. Upload to R2/S3 (grouped by generation, matching the API/render-worker convention)
+    const s3Key = `videos/${video.generationId}/${video.id}.mp4`
     const videoUrl = await uploadToR2(finalPath, s3Key, 'video/mp4')
 
     // 9. Generate thumbnail
     const thumbnailPath = await generateThumbnail(finalPath)
-    const thumbnailS3Key = `videos/${video.projectId}/${video.id}_thumb.jpg`
+    const thumbnailS3Key = `videos/${video.generationId}/${video.id}_thumb.jpg`
     const thumbnailUrl = await uploadToR2(thumbnailPath, thumbnailS3Key, 'image/jpeg')
     
     // 10. Update database with results. Clear `error` because a retried
@@ -377,6 +405,8 @@ export async function processVideo(videoId: string, context?: VideoContext) {
     })
     
     throw error
+  } finally {
+    if (watchdog) clearTimeout(watchdog)
   }
 }
 
@@ -407,7 +437,9 @@ async function prepareAssets(media: any[]): Promise<any> {
       // If s3Key is a full URL, download it
       logger.info(`Downloading from URL: ${item.s3Key}`)
       try {
-        execSync(`curl -L "${item.s3Key}" -o "${tempPath}"`)
+        execSyncBounded(
+          `curl -L "${item.s3Key}" -o "${tempPath}" --fail --silent --show-error --connect-timeout 15 --max-time 180 --retry 2 --retry-delay 2`
+        )
       } catch (error) {
         logger.error('Failed to download image:', error)
       }
@@ -423,7 +455,7 @@ async function prepareAssets(media: any[]): Promise<any> {
         const colors = ['red', 'blue', 'green', 'yellow', 'purple']
         const color = colors[Math.floor(Math.random() * colors.length)]
         try {
-          execSync(`ffmpeg -f lavfi -i color=${color}:s=1920x1080:d=1 -frames:v 1 "${tempPath}" -y`)
+          execSyncBounded(`ffmpeg -f lavfi -i color=${color}:s=1920x1080:d=1 -frames:v 1 "${tempPath}" -y`)
         } catch (ffmpegError) {
           logger.error('Failed to create placeholder image:', ffmpegError)
         }
@@ -434,7 +466,7 @@ async function prepareAssets(media: any[]): Promise<any> {
       const colors = ['red', 'blue', 'green', 'yellow', 'purple']
       const color = colors[Math.floor(Math.random() * colors.length)]
       try {
-        execSync(`ffmpeg -f lavfi -i color=${color}:s=1920x1080:d=1 -frames:v 1 "${tempPath}" -y`)
+        execSyncBounded(`ffmpeg -f lavfi -i color=${color}:s=1920x1080:d=1 -frames:v 1 "${tempPath}" -y`)
       } catch (ffmpegError) {
         logger.error('Failed to create placeholder image:', ffmpegError)
       }
@@ -469,7 +501,7 @@ async function prepareAssets(media: any[]): Promise<any> {
 async function getVideoMetadata(videoPath: string): Promise<any> {
   try {
     const ffprobeCmd = `ffprobe -v quiet -print_format json -show_streams -show_format "${videoPath}"`
-    const output = execSync(ffprobeCmd).toString()
+    const output = execSyncBounded(ffprobeCmd).toString()
     const data = JSON.parse(output)
     
     const videoStream = data.streams.find((s: any) => s.codec_type === 'video')
@@ -535,7 +567,7 @@ async function mixMusicOverFull(
   const hasSpeech = (() => {
     try {
       return (
-        execSync(
+        execSyncBounded(
           `ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "${videoPath}"`,
         )
           .toString()
@@ -584,7 +616,7 @@ async function mixMusicOverFull(
     `-c:v copy -c:a aac -b:a 192k -ar 48000 -ac 2 -movflags +faststart -t ${total.toFixed(3)} -y "${outPath}"`
 
   logger.info('mixMusicOverFull: laying ducked music bed over full timeline', { total, hasSpeech })
-  execSync(cmd, { stdio: ['ignore', 'ignore', 'pipe'] })
+  execSyncBounded(cmd, { stdio: ['ignore', 'ignore', 'pipe'] })
   await fs.stat(outPath)
   return outPath
 }
@@ -630,7 +662,7 @@ async function prependIntroSegments(
 ): Promise<string> {
   const hasAudioStream = (p: string): boolean => {
     try {
-      return execSync(
+      return execSyncBounded(
         `ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "${p}"`,
       ).toString().trim().length > 0
     } catch {
@@ -661,7 +693,7 @@ async function prependIntroSegments(
       if (!seg?.url) continue
       const raw = path.join(workDir, `seg_raw_${i}`)
       try {
-        execSync(`curl -L "${seg.url}" -o "${raw}" --fail --silent --show-error`, {
+        execSyncBounded(`curl -L "${seg.url}" -o "${raw}" --fail --silent --show-error`, {
           stdio: ['ignore', 'ignore', 'pipe'],
         })
         if ((await fs.stat(raw)).size < 100) {
@@ -679,12 +711,12 @@ async function prependIntroSegments(
           // Still image → a clip of `durationSeconds` (default 3s).
           const dur = Number(seg.durationSeconds) > 0 ? Number(seg.durationSeconds) : 3
           if (slideshowHasAudio) {
-            execSync(
+            execSyncBounded(
               `${ffmpegPath} -loop 1 -i "${raw}" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -map 0:v:0 -map 1:a:0 -t ${dur} -vf "${vf}" ${vEnc} -c:a aac -ar 48000 -ac 2 -y "${norm}"`,
               { stdio: ['ignore', 'ignore', 'pipe'] },
             )
           } else {
-            execSync(
+            execSyncBounded(
               `${ffmpegPath} -loop 1 -i "${raw}" -t ${dur} -vf "${vf}" ${vEnc} -an -y "${norm}"`,
               { stdio: ['ignore', 'ignore', 'pipe'] },
             )
@@ -695,17 +727,17 @@ async function prependIntroSegments(
           const segHasAudio = hasAudioStream(raw)
           const keep = seg.keepAudio !== false
           if (slideshowHasAudio && segHasAudio && keep) {
-            execSync(
+            execSyncBounded(
               `${ffmpegPath} -i "${raw}" -map 0:v:0 -map 0:a:0 -vf "${vf}" ${vEnc} -c:a aac -ar 48000 -ac 2 ${trim} -y "${norm}"`,
               { stdio: ['ignore', 'ignore', 'pipe'] },
             )
           } else if (slideshowHasAudio) {
-            execSync(
+            execSyncBounded(
               `${ffmpegPath} -i "${raw}" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -map 0:v:0 -map 1:a:0 -vf "${vf}" ${vEnc} -c:a aac -ar 48000 -ac 2 -shortest ${trim} -y "${norm}"`,
               { stdio: ['ignore', 'ignore', 'pipe'] },
             )
           } else {
-            execSync(
+            execSyncBounded(
               `${ffmpegPath} -i "${raw}" -map 0:v:0 -an -vf "${vf}" ${vEnc} ${trim} -y "${norm}"`,
               { stdio: ['ignore', 'ignore', 'pipe'] },
             )
@@ -741,7 +773,7 @@ async function prependIntroSegments(
         const listPath = path.join(workDir, 'concat_list.txt')
         const lines = [...normPaths.map((p) => `file '${p}'`), `file '${slideshowPath}'`].join('\n') + '\n'
         await fs.writeFile(listPath, lines)
-        execSync(
+        execSyncBounded(
           `${ffmpegPath} -f concat -safe 0 -i "${listPath}" -c copy -movflags +faststart -y "${finalPath}"`,
           { stdio: ['ignore', 'ignore', 'pipe'] },
         )
@@ -758,13 +790,13 @@ async function prependIntroSegments(
       const n = inputs.length
       if (slideshowHasAudio) {
         const streams = inputs.map((_, i) => `[${i}:v][${i}:a]`).join('')
-        execSync(
+        execSyncBounded(
           `${ffmpegPath} ${inFlags} -filter_complex "${streams}concat=n=${n}:v=1:a=1[v][a]" -map "[v]" -map "[a]" ${vEnc} -c:a aac -ar 48000 -ac 2 -movflags +faststart -y "${finalPath}"`,
           { stdio: ['ignore', 'ignore', 'pipe'] },
         )
       } else {
         const streams = inputs.map((_, i) => `[${i}:v]`).join('')
-        execSync(
+        execSyncBounded(
           `${ffmpegPath} ${inFlags} -filter_complex "${streams}concat=n=${n}:v=1:a=0[v]" -map "[v]" ${vEnc} -movflags +faststart -y "${finalPath}"`,
           { stdio: ['ignore', 'ignore', 'pipe'] },
         )
@@ -794,7 +826,7 @@ async function generateThumbnail(videoPath: string, _generator?: any): Promise<s
   try {
     // Extract frame at 1 second
     const ffmpegCmd = `ffmpeg -i "${videoPath}" -ss 00:00:01 -vframes 1 -f image2 "${thumbnailPath}" -y`
-    execSync(ffmpegCmd)
+    execSyncBounded(ffmpegCmd)
 
     return thumbnailPath
   } catch (error) {
@@ -843,16 +875,23 @@ async function resolveAudioAsset(
   const ext = label === 'voiceover' ? 'mp3' : 'mp3'
   const localPath = path.join(workDir, `${label}.${ext}`)
 
+  // Presigned URLs stored in settings expire (~1h) and 403 on delayed or
+  // retried renders. Whenever the asset lives in our own R2 bucket, download it
+  // with the authenticated client (downloadFromR2 extracts the key from the URL
+  // path and ignores the stale signature). Only truly-external URLs are curled.
+  const isOurR2Url = !!url && /\.r2\.cloudflarestorage\.com/i.test(url)
+  const r2Ref: string | undefined = s3Key || (isOurR2Url ? url : undefined)
+
   try {
-    if (url) {
-      logger.info(`Downloading ${label} from URL`, { url })
-      execSync(`curl -L "${url}" -o "${localPath}" --fail --silent --show-error`, {
+    if (r2Ref) {
+      logger.info(`Downloading ${label} from R2 (authenticated)`, { ref: r2Ref.slice(0, 80) })
+      const { downloadFromR2 } = await import('../storage/r2-client.js')
+      await downloadFromR2(r2Ref, localPath)
+    } else if (url) {
+      logger.info(`Downloading ${label} from external URL`, { url })
+      execSyncBounded(`curl -L "${url}" -o "${localPath}" --fail --silent --show-error --connect-timeout 15 --max-time 180 --retry 2 --retry-delay 2`, {
         stdio: ['ignore', 'ignore', 'pipe'],
       })
-    } else if (s3Key) {
-      logger.info(`Downloading ${label} from R2`, { s3Key })
-      const { downloadFromR2 } = await import('../storage/r2-client.js')
-      await downloadFromR2(s3Key, localPath)
     }
     const stats = await fs.stat(localPath)
     if (stats.size < 100) {

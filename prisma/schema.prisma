@@ -16,7 +16,8 @@ datasource db {
 
 model Video {
   id             String    @id @default(cuid())
-  projectId      String
+  organizationId String
+  generationId   String
   scriptId       String?
   mediaIds       String[]  @default([])
   jobId          String?   @unique
@@ -42,7 +43,8 @@ model Video {
   voiceoverStartDelay Float? @default(0.5)
   voiceoverEndDelay   Float? @default(1.0)
 
-  @@index([projectId, status])
+  @@index([organizationId, status])
+  @@index([generationId])
   @@index([jobId])
   @@index([createdBy])
   @@map("videos")
@@ -50,7 +52,8 @@ model Video {
 
 model VideoMedia {
   id             String   @id @default(cuid())
-  projectId      String
+  organizationId String
+  generationId   String
   name           String
   type           String
   tags           String[] @default([])
@@ -66,7 +69,8 @@ model VideoMedia {
   uploadedBy     String
   createdAt      DateTime @default(now())
 
-  @@index([projectId])
+  @@index([organizationId])
+  @@index([generationId])
   @@index([uploadedBy])
   @@index([type])
   @@map("video_media")

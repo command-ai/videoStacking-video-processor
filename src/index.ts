@@ -195,10 +195,40 @@ process.on('SIGTERM', async () => {
   process.exit(0)
 })
 
+// On boot, any video still marked "processing" is an orphan: the render that
+// owned it died when this container last stopped/crashed (renders run in-process
+// and are not resumable). Without this, those rows stay "processing" forever —
+// the "every video failed / stuck" symptom after a restart or redeploy.
+async function reconcileOrphanedRenders() {
+  const STALE_MS = Number(process.env.ORPHAN_STALE_MS) || 5 * 60 * 1000
+  const cutoff = new Date(Date.now() - STALE_MS)
+  try {
+    const result = await prisma.video.updateMany({
+      where: {
+        status: 'processing',
+        OR: [{ startedAt: { lt: cutoff } }, { startedAt: null }],
+      },
+      data: {
+        status: 'failed',
+        error: 'Render interrupted by a service restart — please retry',
+        completedAt: new Date(),
+      },
+    })
+    if (result.count > 0) {
+      logger.warn(`Reconciled ${result.count} orphaned "processing" render(s) → failed on boot`)
+    } else {
+      logger.info('No orphaned renders to reconcile on boot')
+    }
+  } catch (e) {
+    logger.error('Failed to reconcile orphaned renders on boot:', e)
+  }
+}
+
 const PORT = config.PORT
 app.listen(PORT, () => {
   logger.info(`Video processor listening on port ${PORT}`)
   logger.info('Environment:', config.NODE_ENV)
   logger.info('Database connected:', config.DATABASE_URL ? 'Yes' : 'No')
   logger.info('FFmpeg path:', config.FFMPEG_PATH)
+  void reconcileOrphanedRenders()
 })

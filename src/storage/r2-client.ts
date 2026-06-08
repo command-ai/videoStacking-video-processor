@@ -24,11 +24,25 @@ export async function downloadFromR2(s3Key: string, localPath: string): Promise<
   if (useLocalStorage) {
     return downloadFromLocal(s3Key, localPath)
   }
-  
+
+  // Callers (e.g. resolveAudioAsset) may pass a full presigned R2 URL rather
+  // than a bare object key. Using the URL verbatim as the Key yields a
+  // guaranteed NoSuchKey — the documented contract of this fn is "extract the
+  // key from the URL path and ignore the stale signature". Honour it: derive
+  // the key, stripping the leading slash and any path-style bucket prefix.
+  let key = s3Key
+  if (/^https?:\/\//i.test(key)) {
+    const { pathname } = new URL(key)
+    key = pathname.replace(/^\/+/, '')
+    if (config.R2_BUCKET_NAME && key.startsWith(config.R2_BUCKET_NAME + '/')) {
+      key = key.slice(config.R2_BUCKET_NAME.length + 1)
+    }
+  }
+
   try {
     const command = new GetObjectCommand({
       Bucket: config.R2_BUCKET_NAME,
-      Key: s3Key
+      Key: key
     })
 
     const response = await r2Client.send(command)
@@ -40,7 +54,7 @@ export async function downloadFromR2(s3Key: string, localPath: string): Promise<
     const writeStream = fs.createWriteStream(localPath)
     await pipeline(response.Body as any, writeStream)
     
-    logger.info(`Downloaded ${s3Key} to ${localPath}`)
+    logger.info(`Downloaded ${key} to ${localPath}`)
   } catch (error) {
     logger.error(`Failed to download ${s3Key}:`, error)
     throw error

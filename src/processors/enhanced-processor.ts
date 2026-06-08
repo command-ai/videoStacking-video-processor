@@ -82,7 +82,8 @@ export async function processEnhancedVideo(data: EnhancementData) {
         mimeType: 'video/mp4',
         s3Key: originalVideo.s3Key, // Keep original S3 key
         size: BigInt(0), // Will be determined during download
-        projectId: video.projectId,
+        generationId: video.generationId,
+        organizationId: video.organizationId,
         uploadedBy: video.createdBy || '',
         createdAt: new Date(),
         updatedAt: new Date(),
