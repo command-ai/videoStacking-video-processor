@@ -331,10 +331,12 @@ export async function processVideo(videoId: string, context?: VideoContext) {
           finalPath = mixedPath
         }
       } catch (e) {
-        logger.warn('Music-over-intro final pass failed; shipping intro+body without music bed', {
-          videoId,
-          error: e instanceof Error ? e.message : String(e),
-        })
+        // HARD FAIL. The user selected background music; we never silently ship
+        // intro+body without it. Surface the error so the render is marked
+        // failed rather than producing a music-less video.
+        const msg = e instanceof Error ? e.message : String(e)
+        logger.error('Music-over-intro final pass failed — failing render (no silent drop)', { videoId, error: msg })
+        throw new Error(`Selected background music could not be mixed: ${msg}`)
       }
     }
 
@@ -895,19 +897,19 @@ async function resolveAudioAsset(
     }
     const stats = await fs.stat(localPath)
     if (stats.size < 100) {
-      logger.warn(`${label} file is suspiciously small — skipping`, { size: stats.size })
-      return undefined
+      // A selection that downloads to an empty/broken file is a hard failure —
+      // we never silently ship without the audio the user selected.
+      throw new Error(`${label} asset downloaded but is empty/too small (${stats.size} bytes)`)
     }
     return localPath
   } catch (error) {
-    // Non-fatal: log and continue with silent audio. The render still
-    // produces a valid MP4 — only the audio layer is missing for this
-    // platform. Bubbling here would fail the whole platform render for an
-    // audio glitch, which is a worse UX than "no music this time".
-    logger.error(`Failed to resolve ${label} asset`, {
-      error: error instanceof Error ? error.message : error,
-      spec,
-    })
-    return undefined
+    // HARD FAIL. The user explicitly selected this audio (a url/s3Key was
+    // present), so the render MUST include it or fail loudly. Silently
+    // shipping a video without the chosen voice/music is the regression we are
+    // eliminating. The top-level processor catch marks the video failed with
+    // this message.
+    const msg = error instanceof Error ? error.message : String(error)
+    logger.error(`Failed to resolve ${label} asset — failing render (no silent drop)`, { error: msg, spec })
+    throw new Error(`Selected ${label} could not be loaded: ${msg}`)
   }
 }
