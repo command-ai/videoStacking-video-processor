@@ -46,6 +46,9 @@ interface VideoContext {
   platform?: string
   settings?: any
   targetDuration?: number
+  // W1: the dispatching org, asserted against the video row so a caller can't
+  // drive a render of a video belonging to a different organization.
+  organizationId?: string
 }
 
 export async function processVideo(videoId: string, context?: VideoContext) {
@@ -70,11 +73,19 @@ export async function processVideo(videoId: string, context?: VideoContext) {
     const videoCount = await prisma.video.count()
     logger.info(`Total videos in database: ${videoCount}`)
     
-    // 1. Get video details from database
-    const video = await prisma.video.findUnique({
-      where: { id: videoId }
-    })
-    
+    // 1. Get video details from database.
+    // W1: when the dispatcher supplies an organizationId, scope the lookup to it
+    // so a request can't drive a render of another org's video by id. Falls back
+    // to an unscoped lookup only when no org context was provided (internal/legacy
+    // callers), which W2's internal-token auth otherwise gates.
+    const video = context?.organizationId
+      ? await prisma.video.findFirst({
+          where: { id: videoId, organizationId: context.organizationId }
+        })
+      : await prisma.video.findUnique({
+          where: { id: videoId }
+        })
+
     if (!video) {
       throw new Error(`Video ${videoId} not found`)
     }
@@ -121,6 +132,29 @@ export async function processVideo(videoId: string, context?: VideoContext) {
     
     // 3. Prepare assets (and map per-frame overrides onto local paths)
     const assets = await prepareAssets(media)
+
+    // 3a. Persist any non-fatal asset-prep degradations (skipped media) into
+    //     video.metadata.warnings so a degraded-but-shipped render surfaces what
+    //     was left out, instead of completing as a silent success. Best-effort.
+    if (Array.isArray(assets.warnings) && assets.warnings.length > 0) {
+      try {
+        const row = await prisma.video.findUnique({ where: { id: videoId }, select: { metadata: true } })
+        const metadata: any =
+          row?.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
+            ? { ...row.metadata }
+            : {}
+        const existing = Array.isArray(metadata.warnings)
+          ? metadata.warnings.filter((w: unknown): w is string => typeof w === 'string')
+          : []
+        metadata.warnings = [...existing, ...assets.warnings]
+        await prisma.video.update({ where: { id: videoId }, data: { metadata } })
+      } catch (warnErr) {
+        logger.warn('Failed to persist render warnings', {
+          videoId,
+          err: warnErr instanceof Error ? warnErr.message : String(warnErr),
+        })
+      }
+    }
 
     // 3b. Resolve audio assets — background music and TTS voiceover.
     //
@@ -424,7 +458,11 @@ async function prepareAssets(media: any[]): Promise<any> {
     // Parallel to `images` — each entry is the originating VideoMedia id.
     // The video.ts core then applies per-frame overrides from
     // options.settings.frameOverridesByMediaId using this map.
-    imageMediaIds: []
+    imageMediaIds: [],
+    // Non-fatal degradations during asset prep (e.g. a media file failed to
+    // download and was skipped). Surfaced to the user via video.metadata.warnings
+    // instead of silently shipping a video with garbage frames.
+    warnings: [] as string[]
   }
   
   // Create temp directory for assets
@@ -443,7 +481,10 @@ async function prepareAssets(media: any[]): Promise<any> {
           `curl -L "${item.s3Key}" -o "${tempPath}" --fail --silent --show-error --connect-timeout 15 --max-time 180 --retry 2 --retry-delay 2`
         )
       } catch (error) {
-        logger.error('Failed to download image:', error)
+        // Skip + warn — never push a missing file into the render.
+        logger.error('Failed to download image, skipping:', error)
+        assets.warnings.push(`A media file could not be downloaded and was left out of the video (${item.filename}).`)
+        continue
       }
     } else if (item.s3Key) {
       // Download from R2 using the R2 client
@@ -452,26 +493,18 @@ async function prepareAssets(media: any[]): Promise<any> {
         const { downloadFromR2 } = await import('../storage/r2-client.js')
         await downloadFromR2(item.s3Key, tempPath)
       } catch (error) {
-        logger.error('Failed to download from R2:', error)
-        // Fallback to placeholder
-        const colors = ['red', 'blue', 'green', 'yellow', 'purple']
-        const color = colors[Math.floor(Math.random() * colors.length)]
-        try {
-          execSyncBounded(`ffmpeg -f lavfi -i color=${color}:s=1920x1080:d=1 -frames:v 1 "${tempPath}" -y`)
-        } catch (ffmpegError) {
-          logger.error('Failed to create placeholder image:', ffmpegError)
-        }
+        // Do NOT substitute a random colored placeholder — a "successful" video
+        // of random-color frames is worse than a visibly-missing asset. Skip the
+        // item and record a warning so the degradation is surfaced, not hidden.
+        logger.error('Failed to download from R2, skipping:', error)
+        assets.warnings.push(`A media file could not be downloaded and was left out of the video (${item.filename}).`)
+        continue
       }
     } else {
-      // Create a placeholder for testing
-      logger.warn(`No asset found, creating placeholder: ${item.filename}`)
-      const colors = ['red', 'blue', 'green', 'yellow', 'purple']
-      const color = colors[Math.floor(Math.random() * colors.length)]
-      try {
-        execSyncBounded(`ffmpeg -f lavfi -i color=${color}:s=1920x1080:d=1 -frames:v 1 "${tempPath}" -y`)
-      } catch (ffmpegError) {
-        logger.error('Failed to create placeholder image:', ffmpegError)
-      }
+      // No storage key at all — skip + warn rather than inventing a placeholder.
+      logger.warn(`Media item has no storage key, skipping: ${item.filename}`)
+      assets.warnings.push(`A media item had no file and was left out of the video (${item.filename}).`)
+      continue
     }
     
     if (item.mimeType.startsWith('image/')) {
